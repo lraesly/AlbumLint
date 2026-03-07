@@ -26,8 +26,3 @@ targets:
         CODE_SIGN_STYLE: Automatic
         CODE_SIGN_IDENTITY: "Apple Development"
         DEVELOPMENT_TEAM: A52FG8L4Z8
-    entitlements:
-      path: AlbumLint/AlbumLint.entitlements
-      properties:
-        com.apple.security.app-sandbox: false
-        com.apple.security.automation.apple-events: true
