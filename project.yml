@@ -1,0 +1,33 @@
+name: AlbumLint
+options:
+  bundleIdPrefix: com.albumlint
+  deploymentTarget:
+    macOS: "14.0"
+  xcodeVersion: "16.0"
+
+settings:
+  base:
+    SWIFT_VERSION: "5.9"
+    MACOSX_DEPLOYMENT_TARGET: "14.0"
+
+targets:
+  AlbumLint:
+    type: application
+    platform: macOS
+    sources:
+      - AlbumLint
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.albumlint.app
+        INFOPLIST_FILE: AlbumLint/Info.plist
+        CODE_SIGN_ENTITLEMENTS: AlbumLint/AlbumLint.entitlements
+        PRODUCT_NAME: AlbumLint
+        GENERATE_INFOPLIST_FILE: false
+        CODE_SIGN_STYLE: Automatic
+        CODE_SIGN_IDENTITY: "Apple Development"
+        DEVELOPMENT_TEAM: A52FG8L4Z8
+    entitlements:
+      path: AlbumLint/AlbumLint.entitlements
+      properties:
+        com.apple.security.app-sandbox: false
+        com.apple.security.automation.apple-events: true
