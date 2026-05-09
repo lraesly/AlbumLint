@@ -201,6 +201,19 @@ struct AppleScriptBridge {
 
     // MARK: - Playlist Operations
 
+    /// Delete a user playlist by name. No-op (returns true) if the playlist
+    /// doesn't exist. Used to reset accumulator playlists at the start of a run.
+    static func deletePlaylist(name: String) async -> Bool {
+        let script = """
+        tell application "Music"
+            try
+                delete playlist "\(escaped(name))"
+            end try
+        end tell
+        """
+        return await runScript(script) != nil
+    }
+
     /// Add a track to a playlist by name. Creates the playlist if it doesn't exist.
     static func addToPlaylist(persistentID: String, playlistName: String) async -> Bool {
         let script = """

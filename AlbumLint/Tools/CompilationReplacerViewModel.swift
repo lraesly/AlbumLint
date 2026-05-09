@@ -23,6 +23,9 @@ class CompilationReplacerViewModel: ObservableObject {
         do {
             let report = try await tool.run(outputDirectory: outputDirectory)
             var summary = "\(report)"
+            if let playlistName = report.playlistName {
+                summary += " · Playlist: \(playlistName)"
+            }
             if let logURL = report.logURL {
                 summary += " · Log: \(logURL.lastPathComponent)"
                 NSWorkspace.shared.activateFileViewerSelecting([logURL])

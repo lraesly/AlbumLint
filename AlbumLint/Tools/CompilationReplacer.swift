@@ -24,6 +24,11 @@ actor CompilationReplacer {
     /// drift, narrower than fade/edit differences and live-vs-studio gaps.
     private static let durationToleranceSeconds: TimeInterval = 3
 
+    /// Persistent Music.app playlist that mirrors the *most recent* run's
+    /// applied changes. Wiped at the start of every run so it always shows
+    /// just-now activity; the JSONL log files keep the durable history.
+    private static let recentChangesPlaylist = "AlbumLint — Recently Relabeled"
+
     // MARK: - Report
 
     struct RunReport: CustomStringConvertible {
@@ -34,6 +39,9 @@ actor CompilationReplacer {
         var unresolved = 0        // LibraryIndex couldn't map to a persistent ID
         var errors: [String] = []
         var logURL: URL?
+        /// Name of the Music.app playlist accumulating this run's applied
+        /// changes. Populated when applied > 0 so the ViewModel can surface it.
+        var playlistName: String?
 
         var total: Int { applied + skipped + verifyReverted + unmatched + unresolved + errors.count }
 
@@ -67,6 +75,11 @@ actor CompilationReplacer {
         let logURL = try createLogURL(outputDirectory: outputDirectory, prefix: "compilation-run")
         let handle = try FileHandle(forWritingTo: logURL)
         defer { try? handle.close() }
+
+        // Reset the accumulator playlist so it reflects only this run's changes.
+        // Durable history lives in the JSONL log; this playlist is the at-a-glance
+        // browsable view inside Music.app.
+        _ = await AppleScriptBridge.deletePlaylist(name: Self.recentChangesPlaylist)
 
         var report = RunReport(logURL: logURL)
 
@@ -138,8 +151,12 @@ actor CompilationReplacer {
 
             report.applied += 1
             appendLogLine(handle: handle, fields: songFields(song, result: "applied", reason: reason, persistentID: persistentID, candidate: candidate, candidateAlbumArtist: match.albumArtist, before: before))
+            _ = await AppleScriptBridge.addToPlaylist(persistentID: persistentID, playlistName: Self.recentChangesPlaylist)
         }
 
+        if report.applied > 0 {
+            report.playlistName = Self.recentChangesPlaylist
+        }
         log.info("Run complete — \(report)")
         return report
     }
