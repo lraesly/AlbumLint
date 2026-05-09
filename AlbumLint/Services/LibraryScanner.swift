@@ -24,7 +24,7 @@ actor LibraryScanner {
         let albumResponse = try await albumRequest.response()
 
         let compilationAlbumNames = Set(albumResponse.items.compactMap { album -> String? in
-            if album.isCompilation { return album.title }
+            if album.isCompilation == true { return album.title }
             if album.artistName.localizedCaseInsensitiveCompare("Various Artists") == .orderedSame {
                 return album.title
             }
