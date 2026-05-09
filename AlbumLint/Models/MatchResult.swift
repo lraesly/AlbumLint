@@ -20,9 +20,9 @@ enum RowAction: String, Codable {
 struct CompilationMatch: Identifiable {
     let id = UUID()
 
-    // Source (compilation) track
+    // Source (compilation) track — what we'll edit in place.
     let compilationAlbum: String
-    let compilationTrackID: String     // MusicItemID as string
+    let compilationTrackID: String     // Music.app persistent ID
     let artist: String
     let title: String
     let playCount: Int
@@ -31,9 +31,11 @@ struct CompilationMatch: Identifiable {
     let dateAdded: Date?
     let compilationDuration: TimeInterval
     let compilationURL: URL?            // Apple Music link
+    let compilationISRC: String?
 
-    // Matched original track
+    // Matched original track — the album we'll relabel toward.
     var originalAlbum: String?
+    var originalAlbumArtist: String?    // Required by the auto-apply gate; nil if album fetch failed.
     var originalCatalogID: String?      // MusicItemID for catalog song
     var originalDuration: TimeInterval?
     var originalURL: URL?               // Apple Music link
@@ -46,7 +48,15 @@ struct CompilationMatch: Identifiable {
     var durationDelta: TimeInterval?    // seconds difference
     var action: RowAction = .replace
 
-    // Playlists containing the compilation track
+    /// True when the match passes the auto-apply gate (set during scan).
+    /// Drives whether `execute()` applies the relabel without further review.
+    var autoApply: Bool = false
+    /// Human-readable reason the gate did or didn't pass — written to logs
+    /// so the user can audit (and so the needs-review entries explain themselves).
+    var gateReason: String?
+
+    // Playlists containing the compilation track (informational; not modified
+    // by the new in-place edit flow — the persistent ID is preserved).
     var playlists: [String] = []
 }
 

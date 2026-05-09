@@ -14,23 +14,31 @@ actor CatalogMatcher {
         let durationDelta: TimeInterval?
         let matchMethod: String     // "isrc", "search", "none"
         let qualityAvailable: String?
+        /// Album-artist of the matched candidate's release (NOT the track artist).
+        /// Only populated by `findOriginal` — `findStudioVersion` leaves it nil.
+        /// Required by the auto-apply gate to verify the candidate is a single-artist album
+        /// (== track's artist) rather than a Various Artists release with a non-obvious title.
+        let albumArtist: String?
     }
 
     // MARK: - Public API
 
     /// Find the original (non-compilation) album version of a song.
+    /// Populates `MatchResult.albumArtist` via a follow-up album fetch on the
+    /// chosen candidate (one extra request per match) so callers can verify
+    /// single-artist-album status before auto-applying.
     func findOriginal(artist: String, title: String, duration: TimeInterval, isrc: String?) async -> MatchResult {
         // Priority 1: ISRC match
         if let isrc, let result = await matchByISRC(isrc: isrc, duration: duration) {
-            return result
+            return await populatingAlbumArtist(result)
         }
 
         // Priority 2: Search by artist + title with fuzzy scoring
         if let result = await matchBySearch(artist: artist, title: title, duration: duration) {
-            return result
+            return await populatingAlbumArtist(result)
         }
 
-        return MatchResult(catalogSong: nil, confidence: .none, durationDelta: nil, matchMethod: "none", qualityAvailable: nil)
+        return MatchResult(catalogSong: nil, confidence: .none, durationDelta: nil, matchMethod: "none", qualityAvailable: nil, albumArtist: nil)
     }
 
     /// Find a studio version of a live track.
@@ -39,7 +47,29 @@ actor CatalogMatcher {
         if let result = await matchBySearch(artist: artist, title: cleanTitle, duration: duration, excludeLive: true) {
             return result
         }
-        return MatchResult(catalogSong: nil, confidence: .none, durationDelta: nil, matchMethod: "none", qualityAvailable: nil)
+        return MatchResult(catalogSong: nil, confidence: .none, durationDelta: nil, matchMethod: "none", qualityAvailable: nil, albumArtist: nil)
+    }
+
+    /// Fetch the catalog song's album relationship and rebuild the MatchResult
+    /// with its album-artist. Returns the original result unchanged on fetch
+    /// failure (network blip shouldn't blow away an otherwise-good match).
+    private func populatingAlbumArtist(_ result: MatchResult) async -> MatchResult {
+        guard let song = result.catalogSong else { return result }
+        do {
+            let detailed = try await song.with([.albums])
+            let albumArtist = detailed.albums?.first?.artistName
+            return MatchResult(
+                catalogSong: result.catalogSong,
+                confidence: result.confidence,
+                durationDelta: result.durationDelta,
+                matchMethod: result.matchMethod,
+                qualityAvailable: result.qualityAvailable,
+                albumArtist: albumArtist
+            )
+        } catch {
+            log.debug("Album fetch failed for \(song.id.rawValue): \(error)")
+            return result
+        }
     }
 
     // MARK: - ISRC Matching
@@ -69,7 +99,8 @@ actor CatalogMatcher {
                 confidence: confidence,
                 durationDelta: durationDelta,
                 matchMethod: "isrc",
-                qualityAvailable: quality
+                qualityAvailable: quality,
+                albumArtist: nil
             )
         } catch {
             log.error("ISRC search failed for \(isrc): \(error)")
@@ -118,7 +149,8 @@ actor CatalogMatcher {
                 confidence: confidence,
                 durationDelta: durationDelta,
                 matchMethod: "search",
-                qualityAvailable: quality
+                qualityAvailable: quality,
+                albumArtist: nil
             )
         } catch {
             log.error("Catalog search failed for \(artist) - \(title): \(error)")
@@ -244,6 +276,10 @@ actor CatalogMatcher {
     }
 
     /// Heuristic to detect compilation albums by name.
+    /// Note: this is used as a HARD FILTER on candidate results — it must err
+    /// on the side of letting legitimate albums through, not over-matching.
+    /// The auto-apply gate in CompilationReplacer is the place to add stricter
+    /// checks (it's the safety net, not the candidate filter).
     static func looksLikeCompilation(_ albumName: String) -> Bool {
         let lower = albumName.lowercased()
         let patterns = [
@@ -256,6 +292,34 @@ actor CatalogMatcher {
             "now that's what i call"
         ]
         return patterns.contains { lower.contains($0) }
+    }
+
+    /// Detect demos / outtakes / bootleg-series albums. Important for the
+    /// auto-apply gate: an artist's earliest-by-release-date catalog entry
+    /// can be a "Bootleg Series" or "Early Demos" release that's single-artist
+    /// but not the studio album we want to relabel toward.
+    static func looksLikeDemoOrOuttakes(_ albumName: String) -> Bool {
+        guard !albumName.isEmpty else { return false }
+        return albumName.range(
+            of: #"\b(?:demos?|outtakes?|bootleg|sessions|home\s+recordings?|rehearsals?|alternate\s+takes?)\b"#,
+            options: [.regularExpression, .caseInsensitive]
+        ) != nil
+    }
+
+    /// True when one of the two tracks is a live/unplugged/acoustic rendition
+    /// and the other isn't — strong signal that they're different recordings
+    /// even when title and duration agree.
+    static func liveStatusMismatch(
+        currentTitle: String, currentAlbum: String,
+        candidateTitle: String, candidateAlbum: String
+    ) -> Bool {
+        let pattern = #"\b(?:live|unplugged|acoustic)\b"#
+        func hasLive(_ s: String) -> Bool {
+            s.range(of: pattern, options: [.regularExpression, .caseInsensitive]) != nil
+        }
+        let currentLive = hasLive(currentTitle) || hasLive(currentAlbum)
+        let candidateLive = hasLive(candidateTitle) || hasLive(candidateAlbum)
+        return currentLive != candidateLive
     }
 
     // MARK: - Live Detection Helpers

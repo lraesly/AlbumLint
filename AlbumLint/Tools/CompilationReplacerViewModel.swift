@@ -9,32 +9,30 @@ class CompilationReplacerViewModel: ObservableObject {
     @Published var status = "Ready"
 
     private let tool = CompilationReplacer()
-    private var lastOutputURL: URL?
+    private var lastMatches: [CompilationMatch]?
+    private var lastPreviewURL: URL?
 
     private var outputDirectory: URL {
         FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first!
             .appendingPathComponent("AlbumLint")
     }
 
+    /// Scan the library, decide which compilation tracks can be auto-relabeled,
+    /// and write a preview log. The matches are cached in memory so `execute()`
+    /// can apply them without re-scanning.
     func scan() async {
         isScanning = true
         status = "Scanning compilation tracks..."
 
         do {
-            try FileManager.default.createDirectory(at: outputDirectory, withIntermediateDirectories: true)
-            let timestamp = ISO8601DateFormatter().string(from: Date())
-                .replacingOccurrences(of: ":", with: "-")
-            let url = outputDirectory.appendingPathComponent("compilations-\(timestamp).xlsx")
+            let report = try await tool.scan(outputDirectory: outputDirectory)
+            lastMatches = report.matches
+            lastPreviewURL = report.previewLogURL
+            hasResults = report.willApply > 0
 
-            let matches = try await tool.scan(outputURL: url)
-            lastOutputURL = url
-            hasResults = true
+            status = "\(report.total) compilation tracks · \(report.willApply) ready to apply · \(report.needsReview) need review · \(report.unmatched) unmatched. Preview: \(report.previewLogURL.lastPathComponent)"
 
-            let matched = matches.filter { $0.confidence != .none }.count
-            status = "Found \(matches.count) tracks, \(matched) matched. Saved to \(url.lastPathComponent)"
-
-            // Open in default app (Excel/Numbers)
-            NSWorkspace.shared.open(url)
+            NSWorkspace.shared.activateFileViewerSelecting([report.previewLogURL])
         } catch {
             status = "Scan failed: \(error.localizedDescription)"
         }
@@ -42,24 +40,26 @@ class CompilationReplacerViewModel: ObservableObject {
         isScanning = false
     }
 
+    /// Apply the cached scan results in place. Requires a prior `scan()`.
     func execute() async {
-        // Let user pick the reviewed spreadsheet
-        let panel = NSOpenPanel()
-        panel.allowedContentTypes = [.init(filenameExtension: "xlsx")!]
-        panel.directoryURL = outputDirectory
-        panel.message = "Select the reviewed compilation spreadsheet"
-
-        guard panel.runModal() == .OK, let url = panel.url else {
-            status = "Execution cancelled"
+        guard let matches = lastMatches else {
+            status = "No scan results — run Scan first"
             return
         }
 
         isExecuting = true
-        status = "Executing replacements..."
+        status = "Applying replacements..."
 
         do {
-            let report = try await tool.execute(inputURL: url)
-            status = "Done: \(report)"
+            let report = try await tool.execute(matches: matches, outputDirectory: outputDirectory)
+            var summary = "\(report)"
+            if let logURL = report.appliedLogURL {
+                summary += " · Log: \(logURL.lastPathComponent)"
+            }
+            status = summary
+            // Re-scan would be wasteful; clear cache so a stale apply can't re-fire.
+            lastMatches = nil
+            hasResults = false
         } catch {
             status = "Execute failed: \(error.localizedDescription)"
         }

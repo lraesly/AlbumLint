@@ -119,6 +119,57 @@ struct AppleScriptBridge {
         return await runScript(script) != nil
     }
 
+    /// Get the current `album` and `album artist` of a library track.
+    /// Used both to record the pre-edit values for reversibility and to
+    /// verify that an edit stuck (some catalog-sourced tracks revert under
+    /// iCloud Music Library sync).
+    static func getAlbumIdentity(persistentID: String) async -> (album: String, albumArtist: String)? {
+        let script = """
+        tell application "Music"
+            set t to (first track whose persistent ID is "\(escaped(persistentID))")
+            set a to album of t
+            set aa to album artist of t
+            return a & "\u{1f}" & aa
+        end tell
+        """
+        guard let raw = await runScript(script) else { return nil }
+        let parts = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+            .components(separatedBy: "\u{1f}")
+        guard parts.count == 2 else { return nil }
+        return (album: parts[0], albumArtist: parts[1])
+    }
+
+    /// Set both `album` and `album artist` on a library track in a single
+    /// AppleScript transaction. Preserves persistent ID, play count, rating,
+    /// loved status, date added, and playlist memberships — none of those
+    /// are bound to the album/artist fields.
+    static func setAlbumIdentity(persistentID: String, album: String, albumArtist: String) async -> Bool {
+        let script = """
+        tell application "Music"
+            set t to (first track whose persistent ID is "\(escaped(persistentID))")
+            set album of t to "\(escaped(album))"
+            set album artist of t to "\(escaped(albumArtist))"
+        end tell
+        """
+        return await runScript(script) != nil
+    }
+
+    /// Delete all artwork from a library track. Apple Music will not replace
+    /// existing artwork on its own when album metadata changes — the user has
+    /// to refresh manually after this. Deleting it first is what makes the
+    /// refresh actually pick up new art.
+    static func clearArtwork(persistentID: String) async -> Bool {
+        let script = """
+        tell application "Music"
+            set t to (first track whose persistent ID is "\(escaped(persistentID))")
+            try
+                delete every artwork of t
+            end try
+        end tell
+        """
+        return await runScript(script) != nil
+    }
+
     // MARK: - Library Operations
 
     /// Add a track to the library using its Apple Music store URL.
