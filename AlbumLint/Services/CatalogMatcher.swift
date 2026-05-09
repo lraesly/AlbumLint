@@ -93,11 +93,17 @@ actor CatalogMatcher {
             request.limit = 25
             let response = try await request.response()
 
-            // Find non-compilation songs with matching ISRC
-            // Song doesn't have isCompilation — filter by album name heuristic
-            let candidates = response.songs.filter { song in
-                song.isrc == isrc && !Self.looksLikeCompilation(song.albumTitle ?? "")
-            }
+            // Find non-compilation songs with matching ISRC. Same recording can
+            // appear on multiple releases (original + later reissues / comps);
+            // among those, prefer the earliest release date — that's almost
+            // always the original studio album.
+            let candidates = response.songs
+                .filter { song in
+                    song.isrc == isrc && !Self.looksLikeCompilation(song.albumTitle ?? "")
+                }
+                .sorted { (a, b) in
+                    (a.releaseDate ?? .distantFuture) < (b.releaseDate ?? .distantFuture)
+                }
 
             guard let best = candidates.first else { return nil }
 
@@ -125,12 +131,18 @@ actor CatalogMatcher {
     // MARK: - Search Matching with Single-Artist Iteration
 
     /// Search the catalog and walk the top-scored candidates, fetching each
-    /// album to find one whose album_artist == queried artist. Bounded to the
-    /// top 5 candidates so the per-match album fetches stay sane.
+    /// album to find ones whose album_artist == queried artist. Among the
+    /// single-artist matches found, return the one with the earliest release
+    /// date — the original studio album rather than a later greatest-hits or
+    /// anthology compilation by the same artist. Bounded to the top 10
+    /// candidates so the per-match album fetches stay sane.
     ///
-    /// This is the workhorse for `findOriginal`: it solves the "Apple's catalog
-    /// returns another Various Artists compilation as the top hit" failure mode
-    /// that the auto-apply gate would otherwise reject after the fact.
+    /// This is the workhorse for `findOriginal`. It solves two failure modes:
+    /// (1) "Apple's catalog returns another Various Artists compilation as
+    /// the top hit" (rejected by single-artist filter), and (2) "Apple's
+    /// catalog returns the artist's greatest-hits as the top hit because
+    /// scoring barely differentiates by year" (rejected by earliest-release
+    /// preference among single-artist matches).
     private func searchAndPickSingleArtist(
         artist: String, title: String, duration: TimeInterval
     ) async -> MatchResult? {
@@ -154,12 +166,13 @@ actor CatalogMatcher {
                     return (song, s)
                 }
                 .sorted { $0.score > $1.score }
-                .prefix(5)
+                .prefix(10)
 
             guard !scored.isEmpty else { return nil }
 
+            var singleArtistMatches: [MatchResult] = []
             var fallbackBest: MatchResult? = nil
-            for (i, scoredCandidate) in scored.enumerated() {
+            for scoredCandidate in scored {
                 let (song, score) = scoredCandidate
                 guard score > 0.3 else { break }
                 let durationDelta = abs((song.duration ?? 0) - duration)
@@ -175,11 +188,31 @@ actor CatalogMatcher {
                 let withAlbum = await populatingAlbumArtist(result)
 
                 if let aa = withAlbum.albumArtist,
-                   aa.localizedCaseInsensitiveCompare(artist) == .orderedSame {
-                    log.info("Single-artist match (rank \(i + 1)) for \(artist) — \(title): \(song.albumTitle ?? "?")")
-                    return withAlbum
+                   aa.localizedCaseInsensitiveCompare(artist) == .orderedSame,
+                   aa.localizedCaseInsensitiveCompare("Various Artists") != .orderedSame {
+                    singleArtistMatches.append(withAlbum)
                 }
                 if fallbackBest == nil { fallbackBest = withAlbum }
+            }
+
+            // Among single-artist matches, prefer the earliest release date —
+            // typically the original studio album rather than a later comp.
+            if !singleArtistMatches.isEmpty {
+                let earliest = singleArtistMatches.min { a, b in
+                    let aDate = a.catalogSong?.releaseDate ?? .distantFuture
+                    let bDate = b.catalogSong?.releaseDate ?? .distantFuture
+                    return aDate < bDate
+                }
+                if let chosen = earliest {
+                    let yearDesc: String
+                    if let d = chosen.catalogSong?.releaseDate {
+                        yearDesc = "\(Calendar.current.component(.year, from: d))"
+                    } else {
+                        yearDesc = "no date"
+                    }
+                    log.info("Earliest single-artist match for \(artist) — \(title): \(chosen.catalogSong?.albumTitle ?? "?") (\(yearDesc))")
+                    return chosen
+                }
             }
 
             return fallbackBest
