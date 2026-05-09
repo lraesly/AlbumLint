@@ -32,22 +32,55 @@ actor CatalogMatcher {
     /// Populates `MatchResult.albumArtist` via a follow-up album fetch on the
     /// chosen candidate so callers can verify single-artist-album status
     /// before auto-applying.
+    ///
+    /// Resolution order:
+    ///   1. ISRC match (if ISRC available on library track)
+    ///   2. Song search → tier 1 (single-artist studio album, earliest)
+    ///   3. Discography fallback (search artist's albums, find the track)
+    ///   4. Song search → tier 2 (single-artist comp, earliest)
+    ///   5. Song search → multi-artist fallback (gate likely rejects)
+    ///
+    /// `matchMethod` field reflects which path won so the caller can log it.
     func findOriginal(artist: String, title: String, duration: TimeInterval, isrc: String?) async -> MatchResult {
-        // Priority 1: ISRC match
         if let isrc, let result = await matchByISRC(isrc: isrc, duration: duration) {
             return await populatingAlbumArtist(result)
         }
 
-        // Priority 2: Search by artist + title; iterate top candidates,
-        // fetching album for each, returning the first whose album_artist
-        // matches the queried artist (i.e., not a Various Artists comp with
-        // a non-obvious title). Falls back to the best-scored candidate so
-        // the auto-apply gate gets to inspect it explicitly.
-        if let result = await searchAndPickSingleArtist(artist: artist, title: title, duration: duration) {
-            return result
+        let tiers = await searchSongTiers(artist: artist, title: title, duration: duration)
+
+        if let chosen = earliestByReleaseDate(tiers.tier1Studio) {
+            logChoice(tier: "song_tier1", artist: artist, title: title, chosen: chosen)
+            return tagged(chosen, "song_tier1")
+        }
+
+        if let chosen = await findViaDiscography(artist: artist, title: title, duration: duration) {
+            logChoice(tier: "discography", artist: artist, title: title, chosen: chosen)
+            return tagged(chosen, "discography")
+        }
+
+        if let chosen = earliestByReleaseDate(tiers.tier2Comp) {
+            logChoice(tier: "song_tier2", artist: artist, title: title, chosen: chosen)
+            return tagged(chosen, "song_tier2")
+        }
+
+        if let fb = tiers.fallbackBest {
+            return tagged(fb, "song_fallback")
         }
 
         return MatchResult(catalogSong: nil, confidence: .none, durationDelta: nil, matchMethod: "none", qualityAvailable: nil, albumArtist: nil, albumArtworkURL: nil)
+    }
+
+    /// Construct a copy of `r` with a different matchMethod label.
+    private func tagged(_ r: MatchResult, _ method: String) -> MatchResult {
+        MatchResult(
+            catalogSong: r.catalogSong,
+            confidence: r.confidence,
+            durationDelta: r.durationDelta,
+            matchMethod: method,
+            qualityAvailable: r.qualityAvailable,
+            albumArtist: r.albumArtist,
+            albumArtworkURL: r.albumArtworkURL
+        )
     }
 
     /// Find a studio version of a live track.
@@ -136,23 +169,32 @@ actor CatalogMatcher {
 
     // MARK: - Search Matching with Single-Artist Iteration
 
-    /// Search the catalog and walk the top-scored candidates with a strict
-    /// preference order:
+    /// Tiered results from the catalog song search. `findOriginal` picks
+    /// based on tier priority (tier1 first, then discography fallback, then
+    /// tier2, then fallbackBest) so the caller can interleave a discography
+    /// search between tier 1 and tier 2.
+    private struct SongSearchTiers {
+        let tier1Studio: [MatchResult]
+        let tier2Comp: [MatchResult]
+        let fallbackBest: MatchResult?
+        static var empty: SongSearchTiers { .init(tier1Studio: [], tier2Comp: [], fallbackBest: nil) }
+    }
+
+    /// Search the catalog by "artist title" and classify each candidate into:
     ///
     ///   Tier 1: single-artist studio album (album_artist == queried artist
-    ///           AND album NOT looksLikeCompilation), earliest release wins.
+    ///           AND album NOT looksLikeCompilation)
     ///   Tier 2: single-artist compilation (album_artist == queried artist
-    ///           AND album IS looksLikeCompilation), earliest release wins.
-    ///   Fallback: highest-scored candidate (gate may reject).
+    ///           AND album IS looksLikeCompilation)
+    ///   Fallback: highest-scored candidate among any (gate may reject)
     ///
     /// Within iteration we hard-reject Various Artists, demos/outtakes, and
     /// non-album releases (singles, EPs, re-recordings). Iterates up to top
     /// 20 with smart-stop after collecting 3 tier-1 candidates — bounds the
-    /// per-match album-fetch cost while giving room to find the original on
-    /// famous tracks where comps dominate the top of the search.
-    private func searchAndPickSingleArtist(
+    /// per-match album-fetch cost.
+    private func searchSongTiers(
         artist: String, title: String, duration: TimeInterval
-    ) async -> MatchResult? {
+    ) async -> SongSearchTiers {
         do {
             let searchTerm = "\(artist) \(title)"
             var request = MusicCatalogSearchRequest(term: searchTerm, types: [Song.self])
@@ -172,7 +214,7 @@ actor CatalogMatcher {
                 .sorted { $0.score > $1.score }
                 .prefix(20)
 
-            guard !scored.isEmpty else { return nil }
+            guard !scored.isEmpty else { return .empty }
 
             var tier1Studio: [MatchResult] = []
             var tier2Comp: [MatchResult] = []
@@ -183,7 +225,6 @@ actor CatalogMatcher {
                 guard score > 0.3 else { break }
                 let albumTitle = song.albumTitle ?? ""
 
-                // Hard rejects from BOTH tiers — these are never an acceptable target.
                 if Self.looksLikeNonAlbumRelease(albumTitle) { continue }
                 if Self.looksLikeDemoOrOuttakes(albumTitle) { continue }
 
@@ -209,27 +250,92 @@ actor CatalogMatcher {
                     tier2Comp.append(withAlbum)
                 } else {
                     tier1Studio.append(withAlbum)
-                    // Once we have a few studio candidates the chance that a
-                    // significantly-earlier one sits further down the list is
-                    // small. Stop scanning to bound the album-fetch cost.
                     if tier1Studio.count >= 3 { break }
                 }
             }
 
-            // Prefer earliest tier-1 studio match. Fall back to earliest
-            // tier-2 comp. Last resort: the gate-eligible best by score
-            // (gate will likely reject).
-            if let chosen = earliestByReleaseDate(tier1Studio) {
-                logChoice(tier: "studio", artist: artist, title: title, chosen: chosen)
-                return chosen
-            }
-            if let chosen = earliestByReleaseDate(tier2Comp) {
-                logChoice(tier: "single-artist comp", artist: artist, title: title, chosen: chosen)
-                return chosen
-            }
-            return fallbackBest
+            return SongSearchTiers(
+                tier1Studio: tier1Studio,
+                tier2Comp: tier2Comp,
+                fallbackBest: fallbackBest
+            )
         } catch {
-            log.error("Catalog search (iterating) failed for \(artist) - \(title): \(error)")
+            log.error("Catalog song search failed for \(artist) - \(title): \(error)")
+            return .empty
+        }
+    }
+
+    /// Discography fallback: when the song search didn't surface a single-
+    /// artist studio album in its top 20 (common for famous tracks dominated
+    /// by comps in catalog ranking), search for the artist's albums directly,
+    /// walk earliest-first, and find the album that contains a track matching
+    /// our title. Lands on the original studio release rather than whatever
+    /// recent comp happens to outrank it in the song-level search.
+    ///
+    /// Bounded cost: 1 album search + up to 15 track fetches (early stop on
+    /// first hit). Only fires when song-search tier 1 is empty.
+    private func findViaDiscography(
+        artist: String, title: String, duration: TimeInterval
+    ) async -> MatchResult? {
+        do {
+            var request = MusicCatalogSearchRequest(term: artist, types: [Album.self])
+            request.limit = 25
+            let response = try await request.response()
+
+            // Filter to albums matching the queried artist; reject obvious
+            // comps, demos, non-album releases. We want studio releases.
+            let candidateAlbums = response.albums
+                .filter { album in
+                    album.artistName.localizedCaseInsensitiveCompare(artist) == .orderedSame
+                        && !Self.looksLikeCompilation(album.title)
+                        && !Self.looksLikeDemoOrOuttakes(album.title)
+                        && !Self.looksLikeNonAlbumRelease(album.title)
+                }
+                .sorted { (a, b) in
+                    (a.releaseDate ?? .distantFuture) < (b.releaseDate ?? .distantFuture)
+                }
+                .prefix(15)
+
+            guard !candidateAlbums.isEmpty else { return nil }
+
+            let queryTitleClean = Self.cleanTitle(title)
+
+            for album in candidateAlbums {
+                let detailed: Album
+                do {
+                    detailed = try await album.with([.tracks])
+                } catch {
+                    continue
+                }
+                guard let tracks = detailed.tracks else { continue }
+
+                for track in tracks {
+                    guard case .song(let song) = track else { continue }
+                    let songTitleClean = Self.cleanTitle(song.title)
+                    guard songTitleClean.localizedCaseInsensitiveCompare(queryTitleClean) == .orderedSame else { continue }
+                    let durationDelta = abs((song.duration ?? 0) - duration)
+                    // Wider tolerance for discography path — the album may
+                    // host a slightly different mix or master of the same
+                    // recording. Anything under 5s is the same recording.
+                    guard durationDelta <= 5 else { continue }
+
+                    let confidence: MatchConfidence = durationDelta <= 3 ? .high : .medium
+                    let artworkURL = album.artwork?.url(width: 1500, height: 1500)
+                    return MatchResult(
+                        catalogSong: song,
+                        confidence: confidence,
+                        durationDelta: durationDelta,
+                        matchMethod: "discography",
+                        qualityAvailable: describeAudioQuality(song),
+                        albumArtist: album.artistName,
+                        albumArtworkURL: artworkURL
+                    )
+                }
+            }
+
+            return nil
+        } catch {
+            log.error("Discography search failed for \(artist): \(error)")
             return nil
         }
     }
@@ -305,40 +411,45 @@ actor CatalogMatcher {
     // MARK: - Scoring
 
     /// Score a candidate song against the target. Returns 0.0-1.0.
+    /// Year preference is rebalanced from 0.1 to 0.25 weight so older
+    /// originals rise high enough to enter the matcher's iteration window
+    /// rather than getting buried below recent compilations.
     private func score(candidate: Song, targetArtist: String, targetTitle: String, targetDuration: TimeInterval) -> Double {
         var total = 0.0
 
-        // Artist match (0.3 weight)
+        // Artist match (0.25 weight)
         let artistSimilarity = stringSimilarity(candidate.artistName.lowercased(), targetArtist.lowercased())
-        total += artistSimilarity * 0.3
+        total += artistSimilarity * 0.25
 
-        // Title match (0.3 weight)
+        // Title match (0.25 weight)
         let titleSimilarity = stringSimilarity(candidate.title.lowercased(), targetTitle.lowercased())
-        total += titleSimilarity * 0.3
+        total += titleSimilarity * 0.25
 
-        // Duration match (0.3 weight) — most important differentiator
+        // Duration match (0.25 weight)
         let candidateDuration = candidate.duration ?? 0
         if candidateDuration > 0 && targetDuration > 0 {
             let delta = abs(candidateDuration - targetDuration)
             if delta <= 2 {
-                total += 0.3          // Near-exact duration
+                total += 0.25
             } else if delta <= 5 {
-                total += 0.25         // Close enough (fade differences)
+                total += 0.20
             } else if delta <= 15 {
-                total += 0.15         // Possibly different mix
+                total += 0.10
             } else if delta <= 30 {
-                total += 0.05         // Likely different version
+                total += 0.04
             }
-            // > 30s difference: 0 points
         }
 
-        // Prefer earliest release year (0.1 weight) — original over reissue
+        // Year preference (0.25 weight) — strongly prefer original-era releases
+        // so famous tracks' studio originals rise above their many later comps.
         if let releaseDate = candidate.releaseDate {
             let year = Calendar.current.component(.year, from: releaseDate)
-            if year < 1990 { total += 0.1 }
-            else if year < 2000 { total += 0.08 }
-            else if year < 2010 { total += 0.06 }
-            else { total += 0.04 }
+            if year < 1970 { total += 0.25 }
+            else if year < 1980 { total += 0.21 }
+            else if year < 1990 { total += 0.17 }
+            else if year < 2000 { total += 0.13 }
+            else if year < 2010 { total += 0.08 }
+            else { total += 0.03 }
         }
 
         return min(total, 1.0)
@@ -435,7 +546,7 @@ actor CatalogMatcher {
             "20 greatest", "the definitive", "the ultimate",
             "legends", "classic", "hits!", "biggest hits",
             "now that's what i call",
-            "complete", "compilation", "boxed set", "box set",
+            "the complete", "compilation", "boxed set", "box set",
             "album collection"
         ]
         return patterns.contains { lower.contains($0) }

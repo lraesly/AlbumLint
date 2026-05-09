@@ -121,7 +121,7 @@ actor CompilationReplacer {
                   let newAlbum = candidate.albumTitle,
                   let newAlbumArtist = match.albumArtist else {
                 report.skipped += 1
-                appendLogLine(handle: handle, fields: songFields(song, result: "skipped", reason: reason, persistentID: persistentID, candidate: candidate, candidateAlbumArtist: match.albumArtist))
+                appendLogLine(handle: handle, fields: songFields(song, result: "skipped", reason: reason, persistentID: persistentID, candidate: candidate, candidateAlbumArtist: match.albumArtist, matchMethod: match.matchMethod))
                 continue
             }
 
@@ -135,7 +135,7 @@ actor CompilationReplacer {
             guard setOK else {
                 let msg = "\(song.artistName) — \(song.title): setAlbumIdentity failed"
                 report.errors.append(msg)
-                appendLogLine(handle: handle, fields: songFields(song, result: "error", reason: "setAlbumIdentity AppleScript failed", persistentID: persistentID, candidate: candidate, candidateAlbumArtist: match.albumArtist))
+                appendLogLine(handle: handle, fields: songFields(song, result: "error", reason: "setAlbumIdentity AppleScript failed", persistentID: persistentID, candidate: candidate, candidateAlbumArtist: match.albumArtist, matchMethod: match.matchMethod))
                 continue
             }
 
@@ -155,12 +155,12 @@ actor CompilationReplacer {
             let verified = after?.album == newAlbum && after?.albumArtist == newAlbumArtist
             if !verified {
                 report.verifyReverted += 1
-                appendLogLine(handle: handle, fields: songFields(song, result: "verify_reverted", reason: "write reverted (likely iCloud Music Library override)", persistentID: persistentID, candidate: candidate, candidateAlbumArtist: match.albumArtist, before: before))
+                appendLogLine(handle: handle, fields: songFields(song, result: "verify_reverted", reason: "write reverted (likely iCloud Music Library override)", persistentID: persistentID, candidate: candidate, candidateAlbumArtist: match.albumArtist, matchMethod: match.matchMethod, before: before))
                 continue
             }
 
             report.applied += 1
-            appendLogLine(handle: handle, fields: songFields(song, result: "applied", reason: reason, persistentID: persistentID, candidate: candidate, candidateAlbumArtist: match.albumArtist, before: before))
+            appendLogLine(handle: handle, fields: songFields(song, result: "applied", reason: reason, persistentID: persistentID, candidate: candidate, candidateAlbumArtist: match.albumArtist, matchMethod: match.matchMethod, before: before))
             _ = await AppleScriptBridge.addToPlaylist(persistentID: persistentID, playlistName: Self.recentChangesPlaylist)
         }
 
@@ -301,6 +301,7 @@ actor CompilationReplacer {
         persistentID: String? = nil,
         candidate: Song? = nil,
         candidateAlbumArtist: String? = nil,
+        matchMethod: String? = nil,
         before: (album: String, albumArtist: String)? = nil
     ) -> [String: Any] {
         var fields: [String: Any] = [
@@ -314,12 +315,16 @@ actor CompilationReplacer {
             "current_duration": song.duration ?? 0,
         ]
         if let pid = persistentID { fields["persistent_id"] = pid }
+        if let matchMethod { fields["match_method"] = matchMethod }
         if let candidate {
             fields["proposed_title"] = candidate.title
             fields["proposed_album"] = candidate.albumTitle ?? ""
             fields["proposed_album_artist"] = candidateAlbumArtist ?? ""
             fields["proposed_isrc"] = candidate.isrc ?? ""
             fields["proposed_duration"] = candidate.duration ?? 0
+            if let releaseDate = candidate.releaseDate {
+                fields["proposed_year"] = Calendar.current.component(.year, from: releaseDate)
+            }
         }
         if let before {
             fields["old_album"] = before.album
