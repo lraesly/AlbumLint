@@ -25,17 +25,21 @@ actor CatalogMatcher {
 
     /// Find the original (non-compilation) album version of a song.
     /// Populates `MatchResult.albumArtist` via a follow-up album fetch on the
-    /// chosen candidate (one extra request per match) so callers can verify
-    /// single-artist-album status before auto-applying.
+    /// chosen candidate so callers can verify single-artist-album status
+    /// before auto-applying.
     func findOriginal(artist: String, title: String, duration: TimeInterval, isrc: String?) async -> MatchResult {
         // Priority 1: ISRC match
         if let isrc, let result = await matchByISRC(isrc: isrc, duration: duration) {
             return await populatingAlbumArtist(result)
         }
 
-        // Priority 2: Search by artist + title with fuzzy scoring
-        if let result = await matchBySearch(artist: artist, title: title, duration: duration) {
-            return await populatingAlbumArtist(result)
+        // Priority 2: Search by artist + title; iterate top candidates,
+        // fetching album for each, returning the first whose album_artist
+        // matches the queried artist (i.e., not a Various Artists comp with
+        // a non-obvious title). Falls back to the best-scored candidate so
+        // the auto-apply gate gets to inspect it explicitly.
+        if let result = await searchAndPickSingleArtist(artist: artist, title: title, duration: duration) {
+            return result
         }
 
         return MatchResult(catalogSong: nil, confidence: .none, durationDelta: nil, matchMethod: "none", qualityAvailable: nil, albumArtist: nil)
@@ -104,6 +108,72 @@ actor CatalogMatcher {
             )
         } catch {
             log.error("ISRC search failed for \(isrc): \(error)")
+            return nil
+        }
+    }
+
+    // MARK: - Search Matching with Single-Artist Iteration
+
+    /// Search the catalog and walk the top-scored candidates, fetching each
+    /// album to find one whose album_artist == queried artist. Bounded to the
+    /// top 5 candidates so the per-match album fetches stay sane.
+    ///
+    /// This is the workhorse for `findOriginal`: it solves the "Apple's catalog
+    /// returns another Various Artists compilation as the top hit" failure mode
+    /// that the auto-apply gate would otherwise reject after the fact.
+    private func searchAndPickSingleArtist(
+        artist: String, title: String, duration: TimeInterval
+    ) async -> MatchResult? {
+        do {
+            let searchTerm = "\(artist) \(title)"
+            var request = MusicCatalogSearchRequest(term: searchTerm, types: [Song.self])
+            request.limit = 25
+            let response = try await request.response()
+
+            let scored = response.songs
+                .filter { song in
+                    !Self.looksLikeCompilation(song.albumTitle ?? "")
+                }
+                .map { song -> (song: Song, score: Double) in
+                    let s = self.score(
+                        candidate: song,
+                        targetArtist: artist,
+                        targetTitle: title,
+                        targetDuration: duration
+                    )
+                    return (song, s)
+                }
+                .sorted { $0.score > $1.score }
+                .prefix(5)
+
+            guard !scored.isEmpty else { return nil }
+
+            var fallbackBest: MatchResult? = nil
+            for (i, scoredCandidate) in scored.enumerated() {
+                let (song, score) = scoredCandidate
+                guard score > 0.3 else { break }
+                let durationDelta = abs((song.duration ?? 0) - duration)
+                let result = MatchResult(
+                    catalogSong: song,
+                    confidence: confidenceFromScore(score, durationDelta: durationDelta),
+                    durationDelta: durationDelta,
+                    matchMethod: "search",
+                    qualityAvailable: describeAudioQuality(song),
+                    albumArtist: nil
+                )
+                let withAlbum = await populatingAlbumArtist(result)
+
+                if let aa = withAlbum.albumArtist,
+                   aa.localizedCaseInsensitiveCompare(artist) == .orderedSame {
+                    log.info("Single-artist match (rank \(i + 1)) for \(artist) — \(title): \(song.albumTitle ?? "?")")
+                    return withAlbum
+                }
+                if fallbackBest == nil { fallbackBest = withAlbum }
+            }
+
+            return fallbackBest
+        } catch {
+            log.error("Catalog search (iterating) failed for \(artist) - \(title): \(error)")
             return nil
         }
     }

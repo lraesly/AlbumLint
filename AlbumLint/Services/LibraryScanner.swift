@@ -10,20 +10,32 @@ actor LibraryScanner {
     // MARK: - Compilation Scanning
 
     /// Returns all tracks from compilation albums in the user's library.
-    /// Gets compilation album names first, then filters songs by those album names.
+    ///
+    /// An album counts as a compilation when EITHER:
+    ///   - Apple has flagged `Album.isCompilation == true`, OR
+    ///   - the album's `artistName` is "Various Artists" (case-insensitive)
+    ///
+    /// Apple's `isCompilation` flag is unreliable for the user's "Various
+    /// Artists comp" pattern — many such albums in real libraries don't have
+    /// the flag set, so relying on it alone misses the majority of relabel
+    /// candidates. The albumArtist union catches them.
     func compilationTracks() async throws -> [Song] {
-        // Get compilation album names
-        var albumRequest = MusicLibraryRequest<Album>()
-        albumRequest.filter(matching: \.isCompilation, equalTo: true)
+        let albumRequest = MusicLibraryRequest<Album>()
         let albumResponse = try await albumRequest.response()
-        let compilationAlbumNames = Set(albumResponse.items.map(\.title))
+
+        let compilationAlbumNames = Set(albumResponse.items.compactMap { album -> String? in
+            if album.isCompilation { return album.title }
+            if album.artistName.localizedCaseInsensitiveCompare("Various Artists") == .orderedSame {
+                return album.title
+            }
+            return nil
+        })
 
         guard !compilationAlbumNames.isEmpty else {
             log.info("No compilation albums found")
             return []
         }
 
-        // Get all songs, filter to those from compilation albums
         let songRequest = MusicLibraryRequest<Song>()
         let songResponse = try await songRequest.response()
         let songs = songResponse.items.filter { song in
