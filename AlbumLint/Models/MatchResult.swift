@@ -95,6 +95,7 @@ struct DuplicateMatch: Identifiable {
     var confidence: MatchConfidence = .high
     var action: RowAction = .replace
     var playlists: [String] = []        // playlists containing the removed track
+    var durationDelta: TimeInterval = 0 // |keep - remove| in seconds
 }
 
 /// A live track matched to a studio version.

@@ -284,15 +284,28 @@ struct ExcelExporter {
     // MARK: - XML Parsing Helpers
 
     private static func parseSharedStrings(_ data: Data) -> [String] {
-        // Simple regex-based parser for <t>...</t> elements
         let xml = String(data: data, encoding: .utf8) ?? ""
         var strings: [String] = []
-        let pattern = try! NSRegularExpression(pattern: "<t[^>]*>(.*?)</t>", options: .dotMatchesLineSeparators)
-        let matches = pattern.matches(in: xml, range: NSRange(xml.startIndex..., in: xml))
-        for match in matches {
-            if let range = Range(match.range(at: 1), in: xml) {
-                strings.append(xmlUnescape(String(xml[range])))
+        // Iterate <si>...</si> entries. Excel writes empty strings as self-closing
+        // <t/>; the older non-paired regex would skip those and pull in content from
+        // the next entry, shifting every subsequent index by one.
+        let siPattern = try! NSRegularExpression(pattern: "<si[^>]*>(.*?)</si>", options: .dotMatchesLineSeparators)
+        let tPattern = try! NSRegularExpression(pattern: "<t[^>]*?(?:/>|>(.*?)</t>)", options: .dotMatchesLineSeparators)
+        let siMatches = siPattern.matches(in: xml, range: NSRange(xml.startIndex..., in: xml))
+        for siMatch in siMatches {
+            guard let siRange = Range(siMatch.range(at: 1), in: xml) else { continue }
+            let inner = String(xml[siRange])
+            // <si> may contain a single <t> (plain string) or rich-text <r><t>...</t></r>
+            // segments. Concatenate all <t> contents to get the visible string.
+            var combined = ""
+            let tMatches = tPattern.matches(in: inner, range: NSRange(inner.startIndex..., in: inner))
+            for tMatch in tMatches {
+                if let contentRange = Range(tMatch.range(at: 1), in: inner) {
+                    combined += String(inner[contentRange])
+                }
+                // self-closing <t/> matches but contributes nothing; group 1 unset.
             }
+            strings.append(xmlUnescape(combined))
         }
         return strings
     }
@@ -301,11 +314,14 @@ struct ExcelExporter {
         let xml = String(data: data, encoding: .utf8) ?? ""
         var rows: [[String]] = []
 
-        // Parse each <row>
         let rowPattern = try! NSRegularExpression(pattern: "<row[^>]*>(.*?)</row>", options: .dotMatchesLineSeparators)
         let rowMatches = rowPattern.matches(in: xml, range: NSRange(xml.startIndex..., in: xml))
 
-        let cellPattern = try! NSRegularExpression(pattern: "<c[^>]*?(?:t=\"([^\"]*?)\")?[^>]*><v>(.*?)</v></c>", options: .dotMatchesLineSeparators)
+        // Capture the cell's full opening tag (group 1) and value (group 2);
+        // attributes like t="s" are extracted from the opening tag separately so
+        // their order inside <c ...> does not matter.
+        let cellPattern = try! NSRegularExpression(pattern: "<c([^>]*)><v>(.*?)</v></c>", options: .dotMatchesLineSeparators)
+        let typeAttrPattern = try! NSRegularExpression(pattern: "\\bt=\"([^\"]*)\"")
 
         for rowMatch in rowMatches {
             guard let rowRange = Range(rowMatch.range(at: 1), in: xml) else { continue }
@@ -315,11 +331,17 @@ struct ExcelExporter {
             let cellMatches = cellPattern.matches(in: rowXML, range: NSRange(rowXML.startIndex..., in: rowXML))
 
             for cellMatch in cellMatches {
-                let type: String
-                if let typeRange = Range(cellMatch.range(at: 1), in: rowXML) {
-                    type = String(rowXML[typeRange])
+                let attrs: String
+                if let attrsRange = Range(cellMatch.range(at: 1), in: rowXML) {
+                    attrs = String(rowXML[attrsRange])
                 } else {
-                    type = "n"
+                    attrs = ""
+                }
+
+                var type = "n"
+                if let typeMatch = typeAttrPattern.firstMatch(in: attrs, range: NSRange(attrs.startIndex..., in: attrs)),
+                   let typeRange = Range(typeMatch.range(at: 1), in: attrs) {
+                    type = String(attrs[typeRange])
                 }
 
                 if let valueRange = Range(cellMatch.range(at: 2), in: rowXML) {
@@ -327,7 +349,7 @@ struct ExcelExporter {
                     if type == "s", let idx = Int(rawValue), idx < sharedStrings.count {
                         cells.append(sharedStrings[idx])
                     } else {
-                        cells.append(rawValue)
+                        cells.append(xmlUnescape(rawValue))
                     }
                 }
             }

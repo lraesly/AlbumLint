@@ -18,18 +18,33 @@ actor TrackDeDuper {
 
         let groups = try await scanner.duplicateCandidates()
         let playlistIdx = try await playlistManager.buildIndex()
+        let libraryIndex = try await LibraryIndex.build()
 
         var matches: [DuplicateMatch] = []
+        var unresolvedSongs = 0
+        var skippedSelfDupes = 0
 
         for group in groups {
             guard group.count >= 2 else { continue }
 
-            // For each pair in the group, determine which to keep
-            // Sort by quality preference
-            var rankedSongs: [(song: Song, metadata: AppleScriptBridge.TrackMetadata, quality: String)] = []
+            // Resolve every song to its Music.app library persistent ID up front. Any
+            // song that can't be matched in the bulk export is dropped — without a
+            // library ID, downstream metadata reads and AppleScript writes can't work.
+            var rankedSongs: [(song: Song, libID: String, metadata: AppleScriptBridge.TrackMetadata, quality: String)] = []
 
             for song in group {
-                let metadata = await AppleScriptBridge.getMetadata(persistentID: song.id.rawValue)
+                guard let libID = await libraryIndex.resolve(
+                    artist: song.artistName,
+                    title: song.title,
+                    album: song.albumTitle ?? "",
+                    duration: song.duration
+                ) else {
+                    unresolvedSongs += 1
+                    log.warning("No library match: \(song.artistName, privacy: .public) - \(song.title, privacy: .public)")
+                    continue
+                }
+
+                let metadata = await AppleScriptBridge.getMetadata(persistentID: libID)
                 let variants = song.audioVariants ?? []
                 let quality: String
                 if variants.contains(.highResolutionLossless) {
@@ -41,8 +56,12 @@ actor TrackDeDuper {
                 } else {
                     quality = "AAC"
                 }
-                rankedSongs.append((song, metadata, quality))
+                rankedSongs.append((song, libID, metadata, quality))
             }
+
+            // After resolution we may have fewer than 2 distinct library tracks left.
+            let distinctLibIDs = Set(rankedSongs.map { $0.libID })
+            guard distinctLibIDs.count >= 2 else { continue }
 
             // Sort: highest quality first, then non-compilation, then most plays
             rankedSongs.sort { a, b in
@@ -59,19 +78,20 @@ actor TrackDeDuper {
 
             let keep = rankedSongs[0]
             for remove in rankedSongs.dropFirst() {
+                // Defensive: two MusicKit songs occasionally collapse to the same library
+                // entry. Pairing a track with itself would corrupt its metadata.
+                guard remove.libID != keep.libID else {
+                    skippedSelfDupes += 1
+                    continue
+                }
+
                 let mergedPlayCount = keep.metadata.playCount + remove.metadata.playCount
                 let mergedRating = max(keep.metadata.rating, remove.metadata.rating)
                 let mergedLoved = keep.metadata.loved || remove.metadata.loved
 
                 let durationDelta = abs((keep.song.duration ?? 0) - (remove.song.duration ?? 0))
-                let confidence: MatchConfidence
-                if durationDelta <= 5 {
-                    confidence = .high
-                } else if durationDelta <= 15 {
-                    confidence = .medium
-                } else {
-                    confidence = .low
-                }
+                // Anything beyond 3.5s is a different recording — flag for review.
+                let confidence: MatchConfidence = durationDelta <= 3.5 ? .high : .low
 
                 let removePlaylists = await playlistManager.playlistNames(
                     for: remove.song.id.rawValue,
@@ -81,7 +101,7 @@ actor TrackDeDuper {
                 let match = DuplicateMatch(
                     artist: keep.song.artistName,
                     title: keep.song.title,
-                    keepTrackID: keep.song.id.rawValue,
+                    keepTrackID: keep.libID,
                     keepAlbum: keep.song.albumTitle ?? "Unknown",
                     keepPlayCount: keep.metadata.playCount,
                     keepRating: keep.metadata.rating,
@@ -89,7 +109,7 @@ actor TrackDeDuper {
                     keepDuration: keep.song.duration ?? 0,
                     keepURL: keep.song.url,
                     keepQuality: keep.quality,
-                    removeTrackID: remove.song.id.rawValue,
+                    removeTrackID: remove.libID,
                     removeAlbum: remove.song.albumTitle ?? "Unknown",
                     removePlayCount: remove.metadata.playCount,
                     removeRating: remove.metadata.rating,
@@ -102,14 +122,15 @@ actor TrackDeDuper {
                     mergedLoved: mergedLoved,
                     confidence: confidence,
                     action: confidence == .low ? .review : .replace,
-                    playlists: removePlaylists
+                    playlists: removePlaylists,
+                    durationDelta: durationDelta
                 )
                 matches.append(match)
             }
         }
 
         try exportToExcel(matches: matches, url: outputURL)
-        log.info("De-dup scan complete: \(matches.count) duplicate pairs found")
+        log.info("De-dup scan complete: \(matches.count) pairs, \(unresolvedSongs) unresolved, \(skippedSelfDupes) self-dupes skipped")
         return matches
     }
 
@@ -200,7 +221,7 @@ actor TrackDeDuper {
             "remove_track_id", "remove_album", "remove_play_count", "remove_rating",
             "remove_loved", "remove_duration", "remove_link", "remove_quality",
             "merged_play_count", "merged_rating", "merged_loved",
-            "confidence", "action", "playlists"
+            "confidence", "action", "playlists", "duration_diff"
         ]
 
         let rows: [[ExcelExporter.CellValue]] = matches.map { m in
@@ -219,7 +240,8 @@ actor TrackDeDuper {
                 .number(Double(m.mergedPlayCount)), .number(Double(m.mergedRating)),
                 .string(m.mergedLoved ? "true" : "false"),
                 .string(m.confidence.rawValue), .string(m.action.rawValue),
-                .string(m.playlists.joined(separator: ", "))
+                .string(m.playlists.joined(separator: ", ")),
+                .number(m.durationDelta)
             ]
         }
 
