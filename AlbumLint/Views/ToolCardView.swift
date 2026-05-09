@@ -46,6 +46,9 @@ struct ToolCardView: View {
                 .lineLimit(1)
                 .frame(height: 16)
 
+            // Fixed-height top-aligned button stack so the primary button
+            // (Scan / Run) lines up across cards regardless of how many
+            // buttons each card has. Sized to fit the max (3 buttons).
             VStack(spacing: 8) {
                 Button(scanLabel) {
                     Task { await scanAction() }
@@ -69,6 +72,7 @@ struct ToolCardView: View {
                     .disabled(!canRunExtra || isScanning || isExecuting)
                 }
             }
+            .frame(height: 100, alignment: .top)
         }
         .padding(16)
         .frame(maxWidth: .infinity, minHeight: 280)
