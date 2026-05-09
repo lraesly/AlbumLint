@@ -199,6 +199,15 @@ actor CompilationReplacer {
             return (false, "candidate has no album title")
         }
 
+        // Hard reject: when the library track itself has no specific artist
+        // ("Various Artists" appears as the song-level artistName for some
+        // classical/holiday tracks), there's no single artist to bias toward.
+        // Relabeling moves the track from one compilation to another, which
+        // is meaningless and pollutes the library.
+        if song.artistName.localizedCaseInsensitiveCompare("Various Artists") == .orderedSame {
+            return (false, "track artist is 'Various Artists' — no single artist to relabel toward")
+        }
+
         if let trackISRC = song.isrc, !trackISRC.isEmpty,
            let candidateISRC = candidate.isrc, !candidateISRC.isEmpty {
             if trackISRC == candidateISRC {
@@ -207,6 +216,10 @@ actor CompilationReplacer {
                 }
                 if CatalogMatcher.looksLikeDemoOrOuttakes(candidateAlbumTitle) {
                     return (false, "ISRC matched but candidate album looks like demos/outtakes")
+                }
+                if let aa = candidateAlbumArtist,
+                   aa.localizedCaseInsensitiveCompare("Various Artists") == .orderedSame {
+                    return (false, "ISRC matched but candidate album_artist is 'Various Artists' (another compilation)")
                 }
                 return (true, "ISRC match")
             } else {
@@ -227,8 +240,11 @@ actor CompilationReplacer {
         guard let albumArtist = candidateAlbumArtist, !albumArtist.isEmpty else {
             return (false, "candidate album_artist could not be fetched (album lookup failed)")
         }
+        if albumArtist.localizedCaseInsensitiveCompare("Various Artists") == .orderedSame {
+            return (false, "candidate album_artist is 'Various Artists' (another compilation)")
+        }
         if albumArtist.localizedCaseInsensitiveCompare(song.artistName) != .orderedSame {
-            return (false, "candidate album_artist '\(albumArtist)' is not the track artist (likely Various Artists)")
+            return (false, "candidate album_artist '\(albumArtist)' is not the track artist")
         }
         if CatalogMatcher.looksLikeCompilation(candidateAlbumTitle) {
             return (false, "candidate album name suggests compilation")
