@@ -160,12 +160,41 @@ struct AppleScriptBridge {
     /// existing artwork on its own when album metadata changes — the user has
     /// to refresh manually after this. Deleting it first is what makes the
     /// refresh actually pick up new art.
+    ///
+    /// IMPORTANT: For relabel flows, prefer `setArtwork` over `clearArtwork`.
+    /// Deleting triggers Apple Sync Library to auto-restore the cached
+    /// (old-album) artwork within seconds, AND `Get Album Artwork` won't
+    /// re-fetch new art for relabeled tracks because Apple's cache is keyed
+    /// to the persistent ID, not the album. Use `setArtwork` to push the new
+    /// album's cover directly — overwrites stick because no slot is empty.
     static func clearArtwork(persistentID: String) async -> Bool {
         let script = """
         tell application "Music"
             set t to (first track whose persistent ID is "\(escaped(persistentID))")
             try
                 delete every artwork of t
+            end try
+        end tell
+        """
+        return await runScript(script) != nil
+    }
+
+    /// Overwrite a track's artwork with the image at `imagePath` (must be a
+    /// JPEG/PNG file readable by AppleScript's `read ... as picture`).
+    ///
+    /// Overwrites the existing artwork slot in place rather than delete +
+    /// re-add — Apple Music's Sync Library auto-restores the cached artwork
+    /// within seconds of any delete, so an overwrite is the only path that
+    /// actually sticks for cloud library tracks.
+    static func setArtwork(persistentID: String, imagePath: String) async -> Bool {
+        let script = """
+        tell application "Music"
+            set t to (first track whose persistent ID is "\(escaped(persistentID))")
+            set imgData to (read (POSIX file "\(escaped(imagePath))") as picture)
+            try
+                set data of artwork 1 of t to imgData
+            on error
+                set data of (make new artwork at end of artworks of t) to imgData
             end try
         end tell
         """

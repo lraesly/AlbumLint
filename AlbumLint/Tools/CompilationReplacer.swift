@@ -139,7 +139,17 @@ actor CompilationReplacer {
                 continue
             }
 
-            _ = await AppleScriptBridge.clearArtwork(persistentID: persistentID)
+            // Push the new album's artwork directly. Apple's `Get Album Artwork`
+            // and Sync Library auto-restore both fail to fetch art for the
+            // new album on a relabeled track — Apple's artwork cache is keyed
+            // to persistent ID, not to the album field. Overwriting the existing
+            // artwork slot in place sticks (delete + re-add does not).
+            // Best-effort: artwork failure does not block the relabel.
+            if let artworkURL = match.albumArtworkURL,
+               let tempPath = await downloadArtwork(from: artworkURL) {
+                _ = await AppleScriptBridge.setArtwork(persistentID: persistentID, imagePath: tempPath)
+                try? FileManager.default.removeItem(atPath: tempPath)
+            }
 
             let after = await AppleScriptBridge.getAlbumIdentity(persistentID: persistentID)
             let verified = after?.album == newAlbum && after?.albumArtist == newAlbumArtist
@@ -233,6 +243,28 @@ actor CompilationReplacer {
             return (false, "live/unplugged/acoustic status differs")
         }
         return (true, "exact name+artist, duration ±\(Int(Self.durationToleranceSeconds))s, single-artist album, no comp/demo/live signals")
+    }
+
+    // MARK: - Artwork
+
+    /// Download an album artwork image from `url` to a temporary file.
+    /// Returns the temp file path on success, nil on any failure (network,
+    /// non-image content, etc.). Caller is responsible for cleanup.
+    private func downloadArtwork(from url: URL) async -> String? {
+        do {
+            let (data, response) = try await URLSession.shared.data(from: url)
+            guard let httpResponse = response as? HTTPURLResponse,
+                  (200..<300).contains(httpResponse.statusCode) else {
+                log.debug("Artwork download non-2xx for \(url.absoluteString, privacy: .public)")
+                return nil
+            }
+            let tempPath = NSTemporaryDirectory() + "albumlint-artwork-\(UUID().uuidString).jpg"
+            try data.write(to: URL(fileURLWithPath: tempPath))
+            return tempPath
+        } catch {
+            log.debug("Artwork download failed: \(error, privacy: .public)")
+            return nil
+        }
     }
 
     // MARK: - Logs

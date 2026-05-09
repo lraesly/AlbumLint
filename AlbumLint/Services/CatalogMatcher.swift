@@ -19,6 +19,11 @@ actor CatalogMatcher {
         /// Required by the auto-apply gate to verify the candidate is a single-artist album
         /// (== track's artist) rather than a Various Artists release with a non-obvious title.
         let albumArtist: String?
+        /// URL of the album's artwork (1500×1500). Populated by `findOriginal`
+        /// alongside albumArtist via the same album fetch. Used by
+        /// CompilationReplacer to push correct artwork onto the relabeled track —
+        /// Apple Music won't re-fetch on its own when the album field changes.
+        let albumArtworkURL: URL?
     }
 
     // MARK: - Public API
@@ -42,7 +47,7 @@ actor CatalogMatcher {
             return result
         }
 
-        return MatchResult(catalogSong: nil, confidence: .none, durationDelta: nil, matchMethod: "none", qualityAvailable: nil, albumArtist: nil)
+        return MatchResult(catalogSong: nil, confidence: .none, durationDelta: nil, matchMethod: "none", qualityAvailable: nil, albumArtist: nil, albumArtworkURL: nil)
     }
 
     /// Find a studio version of a live track.
@@ -51,24 +56,28 @@ actor CatalogMatcher {
         if let result = await matchBySearch(artist: artist, title: cleanTitle, duration: duration, excludeLive: true) {
             return result
         }
-        return MatchResult(catalogSong: nil, confidence: .none, durationDelta: nil, matchMethod: "none", qualityAvailable: nil, albumArtist: nil)
+        return MatchResult(catalogSong: nil, confidence: .none, durationDelta: nil, matchMethod: "none", qualityAvailable: nil, albumArtist: nil, albumArtworkURL: nil)
     }
 
     /// Fetch the catalog song's album relationship and rebuild the MatchResult
-    /// with its album-artist. Returns the original result unchanged on fetch
-    /// failure (network blip shouldn't blow away an otherwise-good match).
+    /// with its album-artist and album-artwork URL. Returns the original
+    /// result unchanged on fetch failure (network blip shouldn't blow away an
+    /// otherwise-good match).
     private func populatingAlbumArtist(_ result: MatchResult) async -> MatchResult {
         guard let song = result.catalogSong else { return result }
         do {
             let detailed = try await song.with([.albums])
-            let albumArtist = detailed.albums?.first?.artistName
+            let firstAlbum = detailed.albums?.first
+            let albumArtist = firstAlbum?.artistName
+            let artworkURL = firstAlbum?.artwork?.url(width: 1500, height: 1500)
             return MatchResult(
                 catalogSong: result.catalogSong,
                 confidence: result.confidence,
                 durationDelta: result.durationDelta,
                 matchMethod: result.matchMethod,
                 qualityAvailable: result.qualityAvailable,
-                albumArtist: albumArtist
+                albumArtist: albumArtist,
+                albumArtworkURL: artworkURL
             )
         } catch {
             log.debug("Album fetch failed for \(song.id.rawValue): \(error)")
@@ -104,7 +113,8 @@ actor CatalogMatcher {
                 durationDelta: durationDelta,
                 matchMethod: "isrc",
                 qualityAvailable: quality,
-                albumArtist: nil
+                albumArtist: nil,
+                albumArtworkURL: nil
             )
         } catch {
             log.error("ISRC search failed for \(isrc): \(error)")
@@ -159,7 +169,8 @@ actor CatalogMatcher {
                     durationDelta: durationDelta,
                     matchMethod: "search",
                     qualityAvailable: describeAudioQuality(song),
-                    albumArtist: nil
+                    albumArtist: nil,
+                    albumArtworkURL: nil
                 )
                 let withAlbum = await populatingAlbumArtist(result)
 
@@ -220,7 +231,8 @@ actor CatalogMatcher {
                 durationDelta: durationDelta,
                 matchMethod: "search",
                 qualityAvailable: quality,
-                albumArtist: nil
+                albumArtist: nil,
+                albumArtworkURL: nil
             )
         } catch {
             log.error("Catalog search failed for \(artist) - \(title): \(error)")
