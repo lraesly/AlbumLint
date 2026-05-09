@@ -421,6 +421,22 @@ actor CatalogMatcher {
         ) != nil
     }
 
+    /// Strip parenthetical and bracketed qualifiers from a title and collapse
+    /// whitespace. Used by the auto-apply gate to match titles whose parens
+    /// content differs (e.g., "Maggie May" vs "Maggie May (2009 Remaster)" vs
+    /// "Maggie May [Mono]"), which the matcher already considers the same
+    /// recording but a strict equality check would reject.
+    static func cleanTitle(_ title: String) -> String {
+        let stripped = title.replacingOccurrences(
+            of: #"\s*[\(\[][^\)\]]*[\)\]]"#,
+            with: "",
+            options: .regularExpression
+        )
+        return stripped.replacingOccurrences(
+            of: #"\s{2,}"#, with: " ", options: .regularExpression
+        ).trimmingCharacters(in: .whitespaces)
+    }
+
     /// True when one of the two tracks is a live/unplugged/acoustic rendition
     /// and the other isn't — strong signal that they're different recordings
     /// even when title and duration agree.

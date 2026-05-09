@@ -227,7 +227,13 @@ actor CompilationReplacer {
             }
         }
 
-        if candidate.title.localizedCaseInsensitiveCompare(song.title) != .orderedSame {
+        // Compare titles after stripping parenthetical / bracketed qualifiers
+        // so "Maggie May" matches "Maggie May (2009 Remaster)" and similar.
+        // The matcher already considers these the same recording; the gate
+        // shouldn't reject on cosmetic suffix differences.
+        let songTitleClean = CatalogMatcher.cleanTitle(song.title)
+        let candidateTitleClean = CatalogMatcher.cleanTitle(candidate.title)
+        if candidateTitleClean.localizedCaseInsensitiveCompare(songTitleClean) != .orderedSame {
             return (false, "candidate title differs from library title")
         }
         if candidate.artistName.localizedCaseInsensitiveCompare(song.artistName) != .orderedSame {
@@ -306,6 +312,7 @@ actor CompilationReplacer {
         ]
         if let pid = persistentID { fields["persistent_id"] = pid }
         if let candidate {
+            fields["proposed_title"] = candidate.title
             fields["proposed_album"] = candidate.albumTitle ?? ""
             fields["proposed_album_artist"] = candidateAlbumArtist ?? ""
             fields["proposed_isrc"] = candidate.isrc ?? ""
