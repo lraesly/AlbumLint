@@ -211,8 +211,8 @@ actor CompilationReplacer {
         if let trackISRC = song.isrc, !trackISRC.isEmpty,
            let candidateISRC = candidate.isrc, !candidateISRC.isEmpty {
             if trackISRC == candidateISRC {
-                if CatalogMatcher.looksLikeCompilation(candidateAlbumTitle) {
-                    return (false, "ISRC matched but candidate album looks like a compilation")
+                if CatalogMatcher.looksLikeNonAlbumRelease(candidateAlbumTitle) {
+                    return (false, "ISRC matched but candidate is a single / EP / re-recording")
                 }
                 if CatalogMatcher.looksLikeDemoOrOuttakes(candidateAlbumTitle) {
                     return (false, "ISRC matched but candidate album looks like demos/outtakes")
@@ -252,8 +252,11 @@ actor CompilationReplacer {
         if albumArtist.localizedCaseInsensitiveCompare(song.artistName) != .orderedSame {
             return (false, "candidate album_artist '\(albumArtist)' is not the track artist")
         }
-        if CatalogMatcher.looksLikeCompilation(candidateAlbumTitle) {
-            return (false, "candidate album name suggests compilation")
+        // Single-artist compilations (Greatest Hits, Anthology, The Complete X)
+        // are now an ACCEPTABLE tier-2 fallback when no studio album was
+        // found by the matcher. The gate just rejects clearly-wrong releases.
+        if CatalogMatcher.looksLikeNonAlbumRelease(candidateAlbumTitle) {
+            return (false, "candidate album is a single / EP / re-recording")
         }
         if CatalogMatcher.looksLikeDemoOrOuttakes(candidateAlbumTitle) {
             return (false, "candidate album name suggests demos/outtakes")

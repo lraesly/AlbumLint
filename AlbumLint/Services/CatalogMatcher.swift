@@ -93,17 +93,23 @@ actor CatalogMatcher {
             request.limit = 25
             let response = try await request.response()
 
-            // Find non-compilation songs with matching ISRC. Same recording can
-            // appear on multiple releases (original + later reissues / comps);
-            // among those, prefer the earliest release date — that's almost
-            // always the original studio album.
-            let candidates = response.songs
-                .filter { song in
-                    song.isrc == isrc && !Self.looksLikeCompilation(song.albumTitle ?? "")
-                }
-                .sorted { (a, b) in
-                    (a.releaseDate ?? .distantFuture) < (b.releaseDate ?? .distantFuture)
-                }
+            // Same recording can appear on multiple releases. Reject hard
+            // non-album releases (singles / EPs / re-recordings) and demos.
+            // Compilations are NOT rejected — they're an acceptable fallback
+            // if no studio release is found. Within remaining candidates,
+            // prefer the earliest release date.
+            let usable = response.songs.filter { song in
+                guard song.isrc == isrc else { return false }
+                let title = song.albumTitle ?? ""
+                return !Self.looksLikeNonAlbumRelease(title) && !Self.looksLikeDemoOrOuttakes(title)
+            }
+
+            // Tier 1 = studio album, Tier 2 = single-artist comp acceptable fallback.
+            let tier1 = usable.filter { !Self.looksLikeCompilation($0.albumTitle ?? "") }
+            let pool = tier1.isEmpty ? usable : tier1
+            let candidates = pool.sorted { (a, b) in
+                (a.releaseDate ?? .distantFuture) < (b.releaseDate ?? .distantFuture)
+            }
 
             guard let best = candidates.first else { return nil }
 
@@ -130,19 +136,20 @@ actor CatalogMatcher {
 
     // MARK: - Search Matching with Single-Artist Iteration
 
-    /// Search the catalog and walk the top-scored candidates, fetching each
-    /// album to find ones whose album_artist == queried artist. Among the
-    /// single-artist matches found, return the one with the earliest release
-    /// date — the original studio album rather than a later greatest-hits or
-    /// anthology compilation by the same artist. Bounded to the top 10
-    /// candidates so the per-match album fetches stay sane.
+    /// Search the catalog and walk the top-scored candidates with a strict
+    /// preference order:
     ///
-    /// This is the workhorse for `findOriginal`. It solves two failure modes:
-    /// (1) "Apple's catalog returns another Various Artists compilation as
-    /// the top hit" (rejected by single-artist filter), and (2) "Apple's
-    /// catalog returns the artist's greatest-hits as the top hit because
-    /// scoring barely differentiates by year" (rejected by earliest-release
-    /// preference among single-artist matches).
+    ///   Tier 1: single-artist studio album (album_artist == queried artist
+    ///           AND album NOT looksLikeCompilation), earliest release wins.
+    ///   Tier 2: single-artist compilation (album_artist == queried artist
+    ///           AND album IS looksLikeCompilation), earliest release wins.
+    ///   Fallback: highest-scored candidate (gate may reject).
+    ///
+    /// Within iteration we hard-reject Various Artists, demos/outtakes, and
+    /// non-album releases (singles, EPs, re-recordings). Iterates up to top
+    /// 20 with smart-stop after collecting 3 tier-1 candidates — bounds the
+    /// per-match album-fetch cost while giving room to find the original on
+    /// famous tracks where comps dominate the top of the search.
     private func searchAndPickSingleArtist(
         artist: String, title: String, duration: TimeInterval
     ) async -> MatchResult? {
@@ -153,9 +160,6 @@ actor CatalogMatcher {
             let response = try await request.response()
 
             let scored = response.songs
-                .filter { song in
-                    !Self.looksLikeCompilation(song.albumTitle ?? "")
-                }
                 .map { song -> (song: Song, score: Double) in
                     let s = self.score(
                         candidate: song,
@@ -166,15 +170,23 @@ actor CatalogMatcher {
                     return (song, s)
                 }
                 .sorted { $0.score > $1.score }
-                .prefix(10)
+                .prefix(20)
 
             guard !scored.isEmpty else { return nil }
 
-            var singleArtistMatches: [MatchResult] = []
+            var tier1Studio: [MatchResult] = []
+            var tier2Comp: [MatchResult] = []
             var fallbackBest: MatchResult? = nil
+
             for scoredCandidate in scored {
                 let (song, score) = scoredCandidate
                 guard score > 0.3 else { break }
+                let albumTitle = song.albumTitle ?? ""
+
+                // Hard rejects from BOTH tiers — these are never an acceptable target.
+                if Self.looksLikeNonAlbumRelease(albumTitle) { continue }
+                if Self.looksLikeDemoOrOuttakes(albumTitle) { continue }
+
                 let durationDelta = abs((song.duration ?? 0) - duration)
                 let result = MatchResult(
                     catalogSong: song,
@@ -186,40 +198,57 @@ actor CatalogMatcher {
                     albumArtworkURL: nil
                 )
                 let withAlbum = await populatingAlbumArtist(result)
-
-                if let aa = withAlbum.albumArtist,
-                   aa.localizedCaseInsensitiveCompare(artist) == .orderedSame,
-                   aa.localizedCaseInsensitiveCompare("Various Artists") != .orderedSame {
-                    singleArtistMatches.append(withAlbum)
-                }
                 if fallbackBest == nil { fallbackBest = withAlbum }
-            }
 
-            // Among single-artist matches, prefer the earliest release date —
-            // typically the original studio album rather than a later comp.
-            if !singleArtistMatches.isEmpty {
-                let earliest = singleArtistMatches.min { a, b in
-                    let aDate = a.catalogSong?.releaseDate ?? .distantFuture
-                    let bDate = b.catalogSong?.releaseDate ?? .distantFuture
-                    return aDate < bDate
-                }
-                if let chosen = earliest {
-                    let yearDesc: String
-                    if let d = chosen.catalogSong?.releaseDate {
-                        yearDesc = "\(Calendar.current.component(.year, from: d))"
-                    } else {
-                        yearDesc = "no date"
-                    }
-                    log.info("Earliest single-artist match for \(artist) — \(title): \(chosen.catalogSong?.albumTitle ?? "?") (\(yearDesc))")
-                    return chosen
+                guard let aa = withAlbum.albumArtist,
+                      aa.localizedCaseInsensitiveCompare(artist) == .orderedSame,
+                      aa.localizedCaseInsensitiveCompare("Various Artists") != .orderedSame
+                else { continue }
+
+                if Self.looksLikeCompilation(albumTitle) {
+                    tier2Comp.append(withAlbum)
+                } else {
+                    tier1Studio.append(withAlbum)
+                    // Once we have a few studio candidates the chance that a
+                    // significantly-earlier one sits further down the list is
+                    // small. Stop scanning to bound the album-fetch cost.
+                    if tier1Studio.count >= 3 { break }
                 }
             }
 
+            // Prefer earliest tier-1 studio match. Fall back to earliest
+            // tier-2 comp. Last resort: the gate-eligible best by score
+            // (gate will likely reject).
+            if let chosen = earliestByReleaseDate(tier1Studio) {
+                logChoice(tier: "studio", artist: artist, title: title, chosen: chosen)
+                return chosen
+            }
+            if let chosen = earliestByReleaseDate(tier2Comp) {
+                logChoice(tier: "single-artist comp", artist: artist, title: title, chosen: chosen)
+                return chosen
+            }
             return fallbackBest
         } catch {
             log.error("Catalog search (iterating) failed for \(artist) - \(title): \(error)")
             return nil
         }
+    }
+
+    private func earliestByReleaseDate(_ matches: [MatchResult]) -> MatchResult? {
+        matches.min { a, b in
+            (a.catalogSong?.releaseDate ?? .distantFuture)
+                < (b.catalogSong?.releaseDate ?? .distantFuture)
+        }
+    }
+
+    private func logChoice(tier: String, artist: String, title: String, chosen: MatchResult) {
+        let year: String
+        if let d = chosen.catalogSong?.releaseDate {
+            year = "\(Calendar.current.component(.year, from: d))"
+        } else {
+            year = "no date"
+        }
+        log.info("\(tier, privacy: .public) match for \(artist, privacy: .public) — \(title, privacy: .public): \(chosen.catalogSong?.albumTitle ?? "?", privacy: .public) (\(year, privacy: .public))")
     }
 
     // MARK: - Search Matching
@@ -390,11 +419,12 @@ actor CatalogMatcher {
         return false
     }
 
-    /// Heuristic to detect compilation albums by name.
-    /// Note: this is used as a HARD FILTER on candidate results — it must err
-    /// on the side of letting legitimate albums through, not over-matching.
-    /// The auto-apply gate in CompilationReplacer is the place to add stricter
-    /// checks (it's the safety net, not the candidate filter).
+    /// Heuristic to detect compilation albums by name. Single-artist comps
+    /// (like "Greatest Hits", "The Complete Mercury Recordings") are NOT
+    /// hard-rejected by the matcher — they're an acceptable fallback when no
+    /// studio album is found. The matcher uses this to *classify* candidates
+    /// into tier 1 (studio album) vs tier 2 (single-artist comp); the gate
+    /// no longer hard-rejects on it.
     static func looksLikeCompilation(_ albumName: String) -> Bool {
         let lower = albumName.lowercased()
         let patterns = [
@@ -404,7 +434,9 @@ actor CatalogMatcher {
             "number ones", "#1", "no. 1",
             "20 greatest", "the definitive", "the ultimate",
             "legends", "classic", "hits!", "biggest hits",
-            "now that's what i call"
+            "now that's what i call",
+            "complete", "compilation", "boxed set", "box set",
+            "album collection"
         ]
         return patterns.contains { lower.contains($0) }
     }
@@ -417,6 +449,19 @@ actor CatalogMatcher {
         guard !albumName.isEmpty else { return false }
         return albumName.range(
             of: #"\b(?:demos?|outtakes?|bootleg|sessions|home\s+recordings?|rehearsals?|alternate\s+takes?)\b"#,
+            options: [.regularExpression, .caseInsensitive]
+        ) != nil
+    }
+
+    /// Detect releases that aren't an "album" in the studio-or-comp sense:
+    /// singles (`...  - Single`), EPs (`...  - EP`), and re-recordings
+    /// (`(Rerecorded)` / `Re-Recorded`). These are the wrong target for a
+    /// relabel — the user wants the original studio release, not a one-off
+    /// single drop or a later re-recording with different timbre.
+    static func looksLikeNonAlbumRelease(_ albumName: String) -> Bool {
+        guard !albumName.isEmpty else { return false }
+        return albumName.range(
+            of: #"(\s+-\s+(?:single|ep)\b|\bre-?recorded\b)"#,
             options: [.regularExpression, .caseInsensitive]
         ) != nil
     }

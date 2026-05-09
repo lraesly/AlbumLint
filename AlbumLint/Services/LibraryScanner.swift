@@ -11,14 +11,19 @@ actor LibraryScanner {
 
     /// Returns all tracks from compilation albums in the user's library.
     ///
-    /// An album counts as a compilation when EITHER:
+    /// An album counts as a compilation when ANY of:
     ///   - Apple has flagged `Album.isCompilation == true`, OR
-    ///   - the album's `artistName` is "Various Artists" (case-insensitive)
+    ///   - the album's `artistName` is "Various Artists" (case-insensitive), OR
+    ///   - the album's title matches `CatalogMatcher.looksLikeCompilation`
+    ///     ("Greatest Hits", "The Complete X", "Anthology", etc.)
     ///
     /// Apple's `isCompilation` flag is unreliable for the user's "Various
     /// Artists comp" pattern — many such albums in real libraries don't have
     /// the flag set, so relying on it alone misses the majority of relabel
-    /// candidates. The albumArtist union catches them.
+    /// candidates. The album-artist union catches Various Artists comps; the
+    /// name-regex union catches single-artist comps (so previously-relabeled
+    /// tracks that landed on a single-artist comp become visible again, and
+    /// the matcher gets a chance to find their original studio album).
     func compilationTracks() async throws -> [Song] {
         let albumRequest = MusicLibraryRequest<Album>()
         let albumResponse = try await albumRequest.response()
@@ -26,6 +31,9 @@ actor LibraryScanner {
         let compilationAlbumNames = Set(albumResponse.items.compactMap { album -> String? in
             if album.isCompilation == true { return album.title }
             if album.artistName.localizedCaseInsensitiveCompare("Various Artists") == .orderedSame {
+                return album.title
+            }
+            if CatalogMatcher.looksLikeCompilation(album.title) {
                 return album.title
             }
             return nil
