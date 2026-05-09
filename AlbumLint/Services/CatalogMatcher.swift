@@ -7,6 +7,12 @@ private let log = Logger(subsystem: "com.albumlint", category: "CatalogMatcher")
 /// Matches library tracks to original album versions in the Apple Music catalog.
 actor CatalogMatcher {
 
+    /// Hard filter for the song-search path: any candidate whose duration
+    /// drifts more than this from the library track's duration is excluded
+    /// before scoring. Aligned with CompilationReplacer's gate threshold so
+    /// the matcher and the gate agree on what's acceptable.
+    private static let songSearchDurationToleranceSeconds: TimeInterval = 3
+
     /// Result of attempting to match a track to its original album version.
     struct MatchResult {
         let catalogSong: Song?
@@ -201,7 +207,22 @@ actor CatalogMatcher {
             request.limit = 25
             let response = try await request.response()
 
-            let scored = response.songs
+            // Hard pre-filter aligned with the gate: any candidate that the
+            // gate would later reject on duration or title is filtered out
+            // BEFORE scoring. Without this, the year-weighted score would
+            // happily rank an old wrong-duration candidate above a recent
+            // right-duration one, the matcher would pick the old one, and
+            // the gate would reject it — losing a relabel that should have
+            // landed on the right candidate further down.
+            let queryTitleClean = Self.cleanTitle(title)
+            let qualified = response.songs.filter { song in
+                let durationDelta = abs((song.duration ?? 0) - duration)
+                guard durationDelta <= Self.songSearchDurationToleranceSeconds else { return false }
+                let songTitleClean = Self.cleanTitle(song.title)
+                return songTitleClean.localizedCaseInsensitiveCompare(queryTitleClean) == .orderedSame
+            }
+
+            let scored = qualified
                 .map { song -> (song: Song, score: Double) in
                     let s = self.score(
                         candidate: song,
