@@ -4,14 +4,17 @@ struct ToolCardView: View {
     let title: String
     let description: String
     let icon: String
+    var scanLabel: String = "Scan"
     let scanAction: () async -> Void
-    let executeAction: () async -> Void
+    /// Optional second-step button. Pass nil for tools that scan and apply
+    /// in one pass — the button is hidden in that case.
+    var executeAction: (() async -> Void)? = nil
     var extraButtonLabel: String? = nil
     var extraButtonAction: (() async -> Void)? = nil
-    let canExecute: Bool
+    var canExecute: Bool = false
     var canRunExtra: Bool = false
     let isScanning: Bool
-    let isExecuting: Bool
+    var isExecuting: Bool = false
     let status: String
 
     var body: some View {
@@ -44,17 +47,19 @@ struct ToolCardView: View {
                 .frame(height: 16)
 
             VStack(spacing: 8) {
-                Button("Scan") {
+                Button(scanLabel) {
                     Task { await scanAction() }
                 }
                 .buttonStyle(.borderedProminent)
                 .disabled(isScanning || isExecuting)
 
-                Button("Execute") {
-                    Task { await executeAction() }
+                if let executeAction {
+                    Button("Execute") {
+                        Task { await executeAction() }
+                    }
+                    .buttonStyle(.bordered)
+                    .disabled(!canExecute || isScanning || isExecuting)
                 }
-                .buttonStyle(.bordered)
-                .disabled(!canExecute || isScanning || isExecuting)
 
                 if let label = extraButtonLabel, let action = extraButtonAction {
                     Button(label) {

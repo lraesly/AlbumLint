@@ -49,13 +49,11 @@ struct ContentView: View {
             HStack(spacing: 20) {
                 ToolCardView(
                     title: "Compilation Replacer",
-                    description: "Replace compilation tracks with original album versions",
+                    description: "Relabel compilation tracks to their original studio albums",
                     icon: "opticaldisc",
-                    scanAction: { await compilationTool.scan() },
-                    executeAction: { await compilationTool.execute() },
-                    canExecute: compilationTool.hasResults,
-                    isScanning: compilationTool.isScanning,
-                    isExecuting: compilationTool.isExecuting,
+                    scanLabel: "Run",
+                    scanAction: { await compilationTool.run() },
+                    isScanning: compilationTool.isRunning,
                     status: compilationTool.status
                 )
 

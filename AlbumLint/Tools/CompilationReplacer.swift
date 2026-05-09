@@ -6,10 +6,15 @@ private let log = Logger(subsystem: "com.albumlint", category: "CompilationRepla
 
 /// Scans for compilation tracks and relabels them in place to point at their
 /// original studio albums. Preserves persistent ID, playlist memberships,
-/// play count, rating, loved status, and date-added — only `album` and
+/// play count, rating, favorited status, and date-added — only `album` and
 /// `album artist` change. Artwork is cleared so Apple Music will re-fetch it
 /// when the user manually refreshes (Apple won't replace existing artwork
 /// just because metadata changed).
+///
+/// Single-pass: each track is matched, gated, and applied in one loop iteration.
+/// Every track produces one line in the run log with a `result` field
+/// (applied / skipped / verify_reverted / error / unresolved / unmatched) so the
+/// log doubles as both audit trail and reversibility record.
 actor CompilationReplacer {
 
     private let scanner = LibraryScanner()
@@ -19,41 +24,38 @@ actor CompilationReplacer {
     /// drift, narrower than fade/edit differences and live-vs-studio gaps.
     private static let durationToleranceSeconds: TimeInterval = 3
 
-    // MARK: - Reports
+    // MARK: - Report
 
-    struct ScanReport {
-        let matches: [CompilationMatch]
-        let previewLogURL: URL
-        /// Compilation tracks that LibraryIndex couldn't map to a Music.app
-        /// persistent ID — dropped from the run because we have nothing to
-        /// edit. Logged to os.log; usually means a metadata mismatch
-        /// between MusicKit's view and Music.app's view of the same track.
-        let unresolved: Int
-        var total: Int { matches.count }
-        var willApply: Int { matches.filter(\.autoApply).count }
-        var needsReview: Int { matches.filter { !$0.autoApply && $0.originalAlbum != nil }.count }
-        var unmatched: Int { matches.filter { $0.originalAlbum == nil }.count }
-    }
-
-    struct ExecutionReport: CustomStringConvertible {
+    struct RunReport: CustomStringConvertible {
         var applied = 0
-        var verifyReverted = 0
-        var notEligible = 0
+        var skipped = 0           // matched but failed the auto-apply gate
+        var verifyReverted = 0    // write succeeded but readback differed (Sync Library override)
+        var unmatched = 0         // matcher found no candidate
+        var unresolved = 0        // LibraryIndex couldn't map to a persistent ID
         var errors: [String] = []
-        var appliedLogURL: URL?
+        var logURL: URL?
+
+        var total: Int { applied + skipped + verifyReverted + unmatched + unresolved + errors.count }
 
         var description: String {
-            "Applied: \(applied), Verify reverted: \(verifyReverted), Not eligible: \(notEligible), Errors: \(errors.count)"
+            var parts = ["Applied: \(applied)"]
+            if skipped > 0 { parts.append("skipped: \(skipped)") }
+            if verifyReverted > 0 { parts.append("reverted: \(verifyReverted)") }
+            if unmatched > 0 { parts.append("unmatched: \(unmatched)") }
+            if unresolved > 0 { parts.append("unresolved: \(unresolved)") }
+            if !errors.isEmpty { parts.append("errors: \(errors.count)") }
+            return parts.joined(separator: ", ")
         }
     }
 
-    // MARK: - Scan
+    // MARK: - Run
 
-    /// Scan the library for compilation tracks, score each one, and decide
-    /// which can be auto-relabeled. Writes a JSONL preview log; the caller
-    /// hands the returned matches to `execute()` to apply.
-    func scan(outputDirectory: URL) async throws -> ScanReport {
-        log.info("Starting compilation scan")
+    /// Scan and apply in one pass. Each compilation track is matched, gated,
+    /// and (when eligible) relabeled in place. The single JSONL log captures
+    /// every track's outcome — applied entries record old + new values for
+    /// reversibility; non-applied entries record the gate reason for audit.
+    func run(outputDirectory: URL) async throws -> RunReport {
+        log.info("Starting compilation run")
         let compilationSongs = try await scanner.compilationTracks()
         log.info("Found \(compilationSongs.count) compilation tracks")
 
@@ -61,9 +63,13 @@ actor CompilationReplacer {
         // — they're disjoint namespaces. Build the index once so we can translate
         // each library Song to the persistent ID AppleScript actually accepts.
         let libraryIndex = try await LibraryIndex.build()
-        var unresolved = 0
 
-        var matches: [CompilationMatch] = []
+        let logURL = try createLogURL(outputDirectory: outputDirectory, prefix: "compilation-run")
+        let handle = try FileHandle(forWritingTo: logURL)
+        defer { try? handle.close() }
+
+        var report = RunReport(logURL: logURL)
+
         for song in compilationSongs {
             guard let persistentID = await libraryIndex.resolve(
                 artist: song.artistName,
@@ -71,122 +77,70 @@ actor CompilationReplacer {
                 album: song.albumTitle ?? "",
                 duration: song.duration
             ) else {
-                unresolved += 1
-                log.warning("LibraryIndex could not resolve \(song.artistName, privacy: .public) — \(song.title, privacy: .public)")
+                report.unresolved += 1
+                appendLogLine(handle: handle, fields: songFields(song, result: "unresolved", reason: "LibraryIndex could not map this track to a Music.app persistent ID"))
+                log.warning("Unresolved: \(song.artistName, privacy: .public) — \(song.title, privacy: .public)")
                 continue
             }
-            let metadata = await AppleScriptBridge.getMetadata(persistentID: persistentID)
-            let result = await matcher.findOriginal(
+
+            let match = await matcher.findOriginal(
                 artist: song.artistName,
                 title: song.title,
                 duration: song.duration ?? 0,
                 isrc: song.isrc
             )
 
-            var match = CompilationMatch(
-                compilationAlbum: song.albumTitle ?? "Unknown Album",
-                compilationTrackID: persistentID,
-                artist: song.artistName,
-                title: song.title,
-                playCount: metadata.playCount,
-                rating: metadata.rating,
-                loved: metadata.loved,
-                dateAdded: song.libraryAddedDate,
-                compilationDuration: song.duration ?? 0,
-                compilationURL: song.url,
-                compilationISRC: song.isrc,
-                originalAlbum: result.catalogSong?.albumTitle,
-                originalAlbumArtist: result.albumArtist,
-                originalCatalogID: result.catalogSong?.id.rawValue,
-                originalDuration: result.catalogSong?.duration,
-                originalURL: result.catalogSong?.url,
-                originalISRC: result.catalogSong?.isrc,
-                audioQualityAvailable: result.qualityAvailable,
-                qualityWarning: nil,
-                confidence: result.confidence,
-                durationDelta: result.durationDelta
+            guard let candidate = match.catalogSong else {
+                report.unmatched += 1
+                appendLogLine(handle: handle, fields: songFields(song, result: "unmatched", reason: "matcher found no candidate", persistentID: persistentID))
+                continue
+            }
+
+            let (apply, reason) = applyGate(
+                song: song,
+                persistentID: persistentID,
+                candidate: candidate,
+                candidateAlbumArtist: match.albumArtist,
+                durationDelta: match.durationDelta
             )
 
-            if let candidate = result.catalogSong,
-               await matcher.isHigherQuality(song, candidate) {
-                match.qualityWarning = "Compilation has higher quality available"
-            }
-
-            let (apply, reason) = applyGate(match: match, candidate: result.catalogSong)
-            match.autoApply = apply
-            match.gateReason = reason
-            match.action = apply ? .replace : (result.catalogSong == nil ? .skip : .review)
-
-            matches.append(match)
-        }
-
-        let previewURL = try writePreviewLog(matches: matches, outputDirectory: outputDirectory)
-        log.info("Scan complete — resolved: \(matches.count), unresolved: \(unresolved), eligible: \(matches.filter(\.autoApply).count), needs review: \(matches.filter { !$0.autoApply && $0.originalAlbum != nil }.count)")
-        return ScanReport(matches: matches, previewLogURL: previewURL, unresolved: unresolved)
-    }
-
-    // MARK: - Execute
-
-    /// Apply the auto-applicable matches in place: edit `album` and `album artist`
-    /// on the existing library track, clear its artwork, verify the writes stuck.
-    /// Persistent ID and all other metadata (playlists, play count, rating,
-    /// loved, date added) are preserved by virtue of not being touched.
-    func execute(matches: [CompilationMatch], outputDirectory: URL) async throws -> ExecutionReport {
-        let logURL = try createLogURL(outputDirectory: outputDirectory, prefix: "compilation-applied")
-        var report = ExecutionReport(appliedLogURL: logURL)
-
-        let handle = try FileHandle(forWritingTo: logURL)
-        defer { try? handle.close() }
-
-        for match in matches {
-            guard match.autoApply else {
-                report.notEligible += 1
-                continue
-            }
-            guard let newAlbum = match.originalAlbum,
-                  let newAlbumArtist = match.originalAlbumArtist else {
-                report.errors.append("\(match.artist) — \(match.title): missing original album/artist")
+            guard apply,
+                  let newAlbum = candidate.albumTitle,
+                  let newAlbumArtist = match.albumArtist else {
+                report.skipped += 1
+                appendLogLine(handle: handle, fields: songFields(song, result: "skipped", reason: reason, persistentID: persistentID, candidate: candidate, candidateAlbumArtist: match.albumArtist))
                 continue
             }
 
-            let before = await AppleScriptBridge.getAlbumIdentity(persistentID: match.compilationTrackID)
+            let before = await AppleScriptBridge.getAlbumIdentity(persistentID: persistentID)
 
             let setOK = await AppleScriptBridge.setAlbumIdentity(
-                persistentID: match.compilationTrackID,
+                persistentID: persistentID,
                 album: newAlbum,
                 albumArtist: newAlbumArtist
             )
             guard setOK else {
-                report.errors.append("\(match.artist) — \(match.title): setAlbumIdentity failed")
+                let msg = "\(song.artistName) — \(song.title): setAlbumIdentity failed"
+                report.errors.append(msg)
+                appendLogLine(handle: handle, fields: songFields(song, result: "error", reason: "setAlbumIdentity AppleScript failed", persistentID: persistentID, candidate: candidate, candidateAlbumArtist: match.albumArtist))
                 continue
             }
 
-            _ = await AppleScriptBridge.clearArtwork(persistentID: match.compilationTrackID)
+            _ = await AppleScriptBridge.clearArtwork(persistentID: persistentID)
 
-            let after = await AppleScriptBridge.getAlbumIdentity(persistentID: match.compilationTrackID)
+            let after = await AppleScriptBridge.getAlbumIdentity(persistentID: persistentID)
             let verified = after?.album == newAlbum && after?.albumArtist == newAlbumArtist
             if !verified {
                 report.verifyReverted += 1
-                report.errors.append("\(match.artist) — \(match.title): write reverted (Sync Library may be overriding)")
+                appendLogLine(handle: handle, fields: songFields(song, result: "verify_reverted", reason: "write reverted (likely iCloud Music Library override)", persistentID: persistentID, candidate: candidate, candidateAlbumArtist: match.albumArtist, before: before))
                 continue
             }
 
-            appendLogLine(handle: handle, fields: [
-                "ts": ISO8601DateFormatter().string(from: Date()),
-                "persistent_id": match.compilationTrackID,
-                "artist": match.artist,
-                "title": match.title,
-                "old_album": before?.album ?? "",
-                "old_album_artist": before?.albumArtist ?? "",
-                "new_album": newAlbum,
-                "new_album_artist": newAlbumArtist,
-                "duration_delta_seconds": match.durationDelta ?? 0,
-                "gate_reason": match.gateReason ?? "",
-            ])
             report.applied += 1
+            appendLogLine(handle: handle, fields: songFields(song, result: "applied", reason: reason, persistentID: persistentID, candidate: candidate, candidateAlbumArtist: match.albumArtist, before: before))
         }
 
-        log.info("Execution complete — \(report)")
+        log.info("Run complete — \(report)")
         return report
     }
 
@@ -204,21 +158,21 @@ actor CompilationReplacer {
     ///   - candidate album_artist == library artist (single-artist album, not Various Artists)
     ///   - candidate album does NOT match looksLikeCompilation
     ///   - candidate album does NOT match looksLikeDemoOrOuttakes
-    ///   - live-status (live/unplugged/acoustic in either title or album) matches between current and candidate
+    ///   - live/unplugged/acoustic status matches between current and candidate
     ///
     /// Hard skip when ISRCs are present on both but mismatch — different recording.
     private func applyGate(
-        match: CompilationMatch,
-        candidate: Song?
+        song: Song,
+        persistentID: String,
+        candidate: Song,
+        candidateAlbumArtist: String?,
+        durationDelta: TimeInterval?
     ) -> (apply: Bool, reason: String) {
-        guard let candidate = candidate else {
-            return (false, "no candidate match found")
-        }
         guard let candidateAlbumTitle = candidate.albumTitle else {
             return (false, "candidate has no album title")
         }
 
-        if let trackISRC = match.compilationISRC, !trackISRC.isEmpty,
+        if let trackISRC = song.isrc, !trackISRC.isEmpty,
            let candidateISRC = candidate.isrc, !candidateISRC.isEmpty {
             if trackISRC == candidateISRC {
                 if CatalogMatcher.looksLikeCompilation(candidateAlbumTitle) {
@@ -233,20 +187,20 @@ actor CompilationReplacer {
             }
         }
 
-        if candidate.title.localizedCaseInsensitiveCompare(match.title) != .orderedSame {
+        if candidate.title.localizedCaseInsensitiveCompare(song.title) != .orderedSame {
             return (false, "candidate title differs from library title")
         }
-        if candidate.artistName.localizedCaseInsensitiveCompare(match.artist) != .orderedSame {
+        if candidate.artistName.localizedCaseInsensitiveCompare(song.artistName) != .orderedSame {
             return (false, "candidate artist differs from library artist")
         }
-        let durDelta = abs((candidate.duration ?? 0) - match.compilationDuration)
+        let durDelta = abs((candidate.duration ?? 0) - (song.duration ?? 0))
         if durDelta > Self.durationToleranceSeconds {
             return (false, String(format: "duration delta %.1fs exceeds %.0fs tolerance", durDelta, Self.durationToleranceSeconds))
         }
-        guard let albumArtist = match.originalAlbumArtist, !albumArtist.isEmpty else {
+        guard let albumArtist = candidateAlbumArtist, !albumArtist.isEmpty else {
             return (false, "candidate album_artist could not be fetched (album lookup failed)")
         }
-        if albumArtist.localizedCaseInsensitiveCompare(match.artist) != .orderedSame {
+        if albumArtist.localizedCaseInsensitiveCompare(song.artistName) != .orderedSame {
             return (false, "candidate album_artist '\(albumArtist)' is not the track artist (likely Various Artists)")
         }
         if CatalogMatcher.looksLikeCompilation(candidateAlbumTitle) {
@@ -256,7 +210,7 @@ actor CompilationReplacer {
             return (false, "candidate album name suggests demos/outtakes")
         }
         if CatalogMatcher.liveStatusMismatch(
-            currentTitle: match.title, currentAlbum: match.compilationAlbum,
+            currentTitle: song.title, currentAlbum: song.albumTitle ?? "",
             candidateTitle: candidate.title, candidateAlbum: candidateAlbumTitle
         ) {
             return (false, "live/unplugged/acoustic status differs")
@@ -266,27 +220,37 @@ actor CompilationReplacer {
 
     // MARK: - Logs
 
-    private func writePreviewLog(matches: [CompilationMatch], outputDirectory: URL) throws -> URL {
-        let url = try createLogURL(outputDirectory: outputDirectory, prefix: "compilation-preview")
-        let handle = try FileHandle(forWritingTo: url)
-        defer { try? handle.close() }
-        for match in matches {
-            appendLogLine(handle: handle, fields: [
-                "auto_apply": match.autoApply,
-                "gate_reason": match.gateReason ?? "",
-                "persistent_id": match.compilationTrackID,
-                "artist": match.artist,
-                "title": match.title,
-                "current_album": match.compilationAlbum,
-                "proposed_album": match.originalAlbum ?? "",
-                "proposed_album_artist": match.originalAlbumArtist ?? "",
-                "duration_delta_seconds": match.durationDelta ?? 0,
-                "confidence": match.confidence.rawValue,
-                "isrc_current": match.compilationISRC ?? "",
-                "isrc_candidate": match.originalISRC ?? "",
-            ])
+    private func songFields(
+        _ song: Song,
+        result: String,
+        reason: String,
+        persistentID: String? = nil,
+        candidate: Song? = nil,
+        candidateAlbumArtist: String? = nil,
+        before: (album: String, albumArtist: String)? = nil
+    ) -> [String: Any] {
+        var fields: [String: Any] = [
+            "ts": ISO8601DateFormatter().string(from: Date()),
+            "result": result,
+            "reason": reason,
+            "artist": song.artistName,
+            "title": song.title,
+            "current_album": song.albumTitle ?? "",
+            "current_isrc": song.isrc ?? "",
+            "current_duration": song.duration ?? 0,
+        ]
+        if let pid = persistentID { fields["persistent_id"] = pid }
+        if let candidate {
+            fields["proposed_album"] = candidate.albumTitle ?? ""
+            fields["proposed_album_artist"] = candidateAlbumArtist ?? ""
+            fields["proposed_isrc"] = candidate.isrc ?? ""
+            fields["proposed_duration"] = candidate.duration ?? 0
         }
-        return url
+        if let before {
+            fields["old_album"] = before.album
+            fields["old_album_artist"] = before.albumArtist
+        }
+        return fields
     }
 
     private func createLogURL(outputDirectory: URL, prefix: String) throws -> URL {
