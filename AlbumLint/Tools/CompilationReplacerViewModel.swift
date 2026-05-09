@@ -30,7 +30,11 @@ class CompilationReplacerViewModel: ObservableObject {
             lastPreviewURL = report.previewLogURL
             hasResults = report.willApply > 0
 
-            status = "\(report.total) compilation tracks · \(report.willApply) ready to apply · \(report.needsReview) need review · \(report.unmatched) unmatched. Preview: \(report.previewLogURL.lastPathComponent)"
+            var parts = ["\(report.total) compilation tracks", "\(report.willApply) ready to apply", "\(report.needsReview) need review", "\(report.unmatched) unmatched"]
+            if report.unresolved > 0 {
+                parts.append("\(report.unresolved) unresolved (no persistent ID)")
+            }
+            status = parts.joined(separator: " · ") + ". Preview: \(report.previewLogURL.lastPathComponent)"
 
             NSWorkspace.shared.activateFileViewerSelecting([report.previewLogURL])
         } catch {

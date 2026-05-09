@@ -31,11 +31,13 @@ struct AppleScriptBridge {
     }
 
     /// Get loved status for a track.
+    /// Music.app renamed the AppleScript property from `loved` to `favorited`; the older
+    /// name now errors with -10001 (descriptor type mismatch) on every track.
     static func getLoved(persistentID: String) async -> Bool {
         let script = """
         tell application "Music"
             set t to (first track whose persistent ID is "\(escaped(persistentID))")
-            return loved of t
+            return favorited of t
         end tell
         """
         return (await runScript(script))?.trimmingCharacters(in: .whitespacesAndNewlines) == "true"
@@ -55,7 +57,7 @@ struct AppleScriptBridge {
             set t to (first track whose persistent ID is "\(escaped(persistentID))")
             set pc to played count of t
             set r to rating of t
-            set l to loved of t
+            set l to favorited of t
             return (pc as text) & "|" & (r as text) & "|" & (l as text)
         end tell
         """
@@ -99,7 +101,7 @@ struct AppleScriptBridge {
         let script = """
         tell application "Music"
             set t to (first track whose persistent ID is "\(escaped(persistentID))")
-            set loved of t to \(loved)
+            set favorited of t to \(loved)
         end tell
         """
         return await runScript(script) != nil
@@ -113,7 +115,7 @@ struct AppleScriptBridge {
             set t to (first track whose persistent ID is "\(escaped(persistentID))")
             set played count of t to \(playCount)
             set rating of t to \(clamped)
-            set loved of t to \(loved)
+            set favorited of t to \(loved)
         end tell
         """
         return await runScript(script) != nil
@@ -262,6 +264,43 @@ struct AppleScriptBridge {
 
     // MARK: - Script Execution
 
+    /// Run an AppleScript that may produce output larger than the pipe buffer (~64KB).
+    /// Drains stdout before waiting for exit to avoid the deadlock that would happen
+    /// if the child blocked on a full pipe while the parent blocked on waitUntilExit.
+    /// Used by LibraryIndex.build() for the bulk library export.
+    static func runLargeScript(_ script: String) async -> String? {
+        await withCheckedContinuation { continuation in
+            DispatchQueue.global(qos: .userInitiated).async {
+                let process = Process()
+                process.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
+                process.arguments = ["-e", script]
+
+                let pipe = Pipe()
+                let errorPipe = Pipe()
+                process.standardOutput = pipe
+                process.standardError = errorPipe
+
+                do {
+                    try process.run()
+                    let outputData = pipe.fileHandleForReading.readDataToEndOfFile()
+                    process.waitUntilExit()
+
+                    if process.terminationStatus == 0 {
+                        continuation.resume(returning: String(data: outputData, encoding: .utf8))
+                    } else {
+                        let errorData = errorPipe.fileHandleForReading.readDataToEndOfFile()
+                        let errorMsg = String(data: errorData, encoding: .utf8) ?? "Unknown error"
+                        log.error("AppleScript failed: \(errorMsg, privacy: .public)")
+                        continuation.resume(returning: nil)
+                    }
+                } catch {
+                    log.error("Failed to run osascript: \(error, privacy: .public)")
+                    continuation.resume(returning: nil)
+                }
+            }
+        }
+    }
+
     private static func runScript(_ script: String) async -> String? {
         await withCheckedContinuation { continuation in
             DispatchQueue.global(qos: .userInitiated).async {
@@ -285,11 +324,11 @@ struct AppleScriptBridge {
                     } else {
                         let errorData = errorPipe.fileHandleForReading.readDataToEndOfFile()
                         let errorMsg = String(data: errorData, encoding: .utf8) ?? "Unknown error"
-                        log.error("AppleScript failed: \(errorMsg)")
+                        log.error("AppleScript failed: \(errorMsg, privacy: .public)")
                         continuation.resume(returning: nil)
                     }
                 } catch {
-                    log.error("Failed to run osascript: \(error)")
+                    log.error("Failed to run osascript: \(error, privacy: .public)")
                     continuation.resume(returning: nil)
                 }
             }

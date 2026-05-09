@@ -15,6 +15,7 @@
 		868C80455F0EE74E462EBA3C /* ExcelExporter.swift in Sources */ = {isa = PBXBuildFile; fileRef = 484ABE4F71CCA02FE93C9363 /* ExcelExporter.swift */; };
 		931A35E9AF20741641C13F75 /* CompilationReplacer.swift in Sources */ = {isa = PBXBuildFile; fileRef = FFD48331E7FD5DA6ED925141 /* CompilationReplacer.swift */; };
 		9625251E1A63384CA9E08F63 /* AlbumLintApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = B1F03FFE96A0A451A78EA670 /* AlbumLintApp.swift */; };
+		C3CFECF62C9E72D835500D1A /* LibraryIndex.swift in Sources */ = {isa = PBXBuildFile; fileRef = A9C137CB8F963F99B759411A /* LibraryIndex.swift */; };
 		CEF37BA90E921190F5BACDA2 /* AppleScriptBridge.swift in Sources */ = {isa = PBXBuildFile; fileRef = C4D7BCCC8C6C052A6BF05D77 /* AppleScriptBridge.swift */; };
 		E2E9876C33BB7A861360131C /* ToolCardView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 33A1BAE7B2753C9AA702C1C0 /* ToolCardView.swift */; };
 		E6B7356D77134C869BF09143 /* PlaylistManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4D7835399C84884624A722C2 /* PlaylistManager.swift */; };
@@ -38,6 +39,7 @@
 		64896549FB04E23CD620FADA /* ContentView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ContentView.swift; sourceTree = "<group>"; };
 		7D8BEC6595E18C207BB819EC /* LiveToStudioReplacer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LiveToStudioReplacer.swift; sourceTree = "<group>"; };
 		99B8092745B850E57E30B65A /* TrackDeDuperViewModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TrackDeDuperViewModel.swift; sourceTree = "<group>"; };
+		A9C137CB8F963F99B759411A /* LibraryIndex.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LibraryIndex.swift; sourceTree = "<group>"; };
 		B1F03FFE96A0A451A78EA670 /* AlbumLintApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AlbumLintApp.swift; sourceTree = "<group>"; };
 		BBBB9559157337C41730012F /* AlbumLint.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = AlbumLint.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		C4D7BCCC8C6C052A6BF05D77 /* AppleScriptBridge.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppleScriptBridge.swift; sourceTree = "<group>"; };
@@ -104,6 +106,7 @@
 				C4D7BCCC8C6C052A6BF05D77 /* AppleScriptBridge.swift */,
 				F078F4AC86F2FFE4C4131323 /* CatalogMatcher.swift */,
 				484ABE4F71CCA02FE93C9363 /* ExcelExporter.swift */,
+				A9C137CB8F963F99B759411A /* LibraryIndex.swift */,
 				548AEF8FE74D2D473BF8CB1E /* LibraryScanner.swift */,
 				4D7835399C84884624A722C2 /* PlaylistManager.swift */,
 			);
@@ -154,7 +157,6 @@
 				};
 			};
 			buildConfigurationList = D51EEEEAE00004F27E831B30 /* Build configuration list for PBXProject "AlbumLint" */;
-			compatibilityVersion = "Xcode 14.0";
 			developmentRegion = en;
 			hasScannedForEncodings = 0;
 			knownRegions = (
@@ -164,6 +166,7 @@
 			mainGroup = 81117F41610515FF785E6A0A;
 			minimizedProjectReferenceProxies = 1;
 			preferredProjectObjectVersion = 77;
+			productRefGroup = F5158A741CC6E963382D3DA8 /* Products */;
 			projectDirPath = "";
 			projectRoot = "";
 			targets = (
@@ -184,6 +187,7 @@
 				1757F0A3FBF0FFFE7FA3E5D6 /* CompilationReplacerViewModel.swift in Sources */,
 				F304B60B67E0541D163E18CC /* ContentView.swift in Sources */,
 				868C80455F0EE74E462EBA3C /* ExcelExporter.swift in Sources */,
+				C3CFECF62C9E72D835500D1A /* LibraryIndex.swift in Sources */,
 				14A43ADCF0AE2E38559CEBEF /* LibraryScanner.swift in Sources */,
 				7D8F692C1DF61BDFB9ECD0D9 /* LiveToStudioReplacer.swift in Sources */,
 				2D7957A78E1DE69E70DAC937 /* LiveToStudioViewModel.swift in Sources */,

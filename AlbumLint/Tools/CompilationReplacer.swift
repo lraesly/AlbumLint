@@ -24,6 +24,11 @@ actor CompilationReplacer {
     struct ScanReport {
         let matches: [CompilationMatch]
         let previewLogURL: URL
+        /// Compilation tracks that LibraryIndex couldn't map to a Music.app
+        /// persistent ID — dropped from the run because we have nothing to
+        /// edit. Logged to os.log; usually means a metadata mismatch
+        /// between MusicKit's view and Music.app's view of the same track.
+        let unresolved: Int
         var total: Int { matches.count }
         var willApply: Int { matches.filter(\.autoApply).count }
         var needsReview: Int { matches.filter { !$0.autoApply && $0.originalAlbum != nil }.count }
@@ -52,9 +57,25 @@ actor CompilationReplacer {
         let compilationSongs = try await scanner.compilationTracks()
         log.info("Found \(compilationSongs.count) compilation tracks")
 
+        // MusicKit's Song.id.rawValue is a catalog ID, not a Music.app persistent ID
+        // — they're disjoint namespaces. Build the index once so we can translate
+        // each library Song to the persistent ID AppleScript actually accepts.
+        let libraryIndex = try await LibraryIndex.build()
+        var unresolved = 0
+
         var matches: [CompilationMatch] = []
         for song in compilationSongs {
-            let metadata = await AppleScriptBridge.getMetadata(persistentID: song.id.rawValue)
+            guard let persistentID = await libraryIndex.resolve(
+                artist: song.artistName,
+                title: song.title,
+                album: song.albumTitle ?? "",
+                duration: song.duration
+            ) else {
+                unresolved += 1
+                log.warning("LibraryIndex could not resolve \(song.artistName, privacy: .public) — \(song.title, privacy: .public)")
+                continue
+            }
+            let metadata = await AppleScriptBridge.getMetadata(persistentID: persistentID)
             let result = await matcher.findOriginal(
                 artist: song.artistName,
                 title: song.title,
@@ -64,7 +85,7 @@ actor CompilationReplacer {
 
             var match = CompilationMatch(
                 compilationAlbum: song.albumTitle ?? "Unknown Album",
-                compilationTrackID: song.id.rawValue,
+                compilationTrackID: persistentID,
                 artist: song.artistName,
                 title: song.title,
                 playCount: metadata.playCount,
@@ -100,8 +121,8 @@ actor CompilationReplacer {
         }
 
         let previewURL = try writePreviewLog(matches: matches, outputDirectory: outputDirectory)
-        log.info("Scan complete — total: \(matches.count), eligible: \(matches.filter(\.autoApply).count), needs review: \(matches.filter { !$0.autoApply && $0.originalAlbum != nil }.count)")
-        return ScanReport(matches: matches, previewLogURL: previewURL)
+        log.info("Scan complete — resolved: \(matches.count), unresolved: \(unresolved), eligible: \(matches.filter(\.autoApply).count), needs review: \(matches.filter { !$0.autoApply && $0.originalAlbum != nil }.count)")
+        return ScanReport(matches: matches, previewLogURL: previewURL, unresolved: unresolved)
     }
 
     // MARK: - Execute
